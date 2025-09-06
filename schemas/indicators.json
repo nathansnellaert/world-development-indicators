@@ -1,0 +1,72 @@
+{
+  "id": "wb_indicators",
+  "title": "World Bank Indicators",
+  "description": "Metadata for all World Development Indicators, including indicator codes, names, topics, and measurement details.",
+  "license": "CC-BY-4.0",
+  "source_id": "world_bank",
+  "columns": [
+    {
+      "id": "indicator_code",
+      "description": "World Bank indicator code",
+      "type": "string",
+      "nullable": false,
+      "unique": true
+    },
+    {
+      "id": "indicator_name",
+      "description": "Full name/description of the indicator",
+      "type": "string",
+      "nullable": false,
+      "unique": false
+    },
+    {
+      "id": "source_note",
+      "description": "Detailed description and methodology for the indicator",
+      "type": "string",
+      "nullable": true,
+      "unique": false
+    },
+    {
+      "id": "source_organization",
+      "description": "Organization that provides the data for this indicator",
+      "type": "string",
+      "nullable": true,
+      "unique": false
+    },
+    {
+      "id": "topic_code",
+      "description": "World Bank topic category code",
+      "type": "string",
+      "nullable": true,
+      "unique": false
+    },
+    {
+      "id": "topic_name",
+      "description": "World Bank topic category name",
+      "type": "string",
+      "nullable": true,
+      "unique": false
+    },
+    {
+      "id": "unit",
+      "description": "Unit of measurement for the indicator",
+      "type": "string",
+      "nullable": true,
+      "unique": false
+    },
+    {
+      "id": "scale",
+      "description": "Scale of the measurement (e.g., thousands, millions)",
+      "type": "string",
+      "nullable": true,
+      "unique": false
+    },
+    {
+      "id": "decimal_places",
+      "description": "Number of decimal places for the indicator values",
+      "type": "integer",
+      "nullable": true,
+      "unique": false
+    }
+  ]
+}
