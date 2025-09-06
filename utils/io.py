@@ -135,7 +135,7 @@ class IcebergStorage:
         except CommitFailedException as e:
             if "DataInvalid" in str(e):
                 # Default to true - continue on snapshot mismatch errors
-                if os.environ.get('CONTINUE_ON_SNAPSHOT_ERROR', 'true').lower() != 'false':
+                if os.environ.get('CONTINUE_ON_SNAPSHOT_ERROR', 'false').lower() == 'true':
                     logger.debug(f"Snapshot mismatch for {dataset_name}, continuing (data likely already exists)")
                 else:
                     raise
@@ -258,6 +258,11 @@ def upload_data(data: pa.Table, dataset_name: str, partition: str = None) -> str
     Returns:
         str: The storage path where data was saved
     """
+    # Print upload info
+    size_mb = round(data.nbytes / 1024 / 1024, 2)
+    columns = ', '.join([f.name for f in data.schema])
+    print(f"Uploading {dataset_name}: {len(data)} rows, {len(data.schema)} cols ({columns}), {size_mb} MB")
+    
     # Upload data
     storage = _get_storage()
     key = storage.upload_data(data, dataset_name, partition)
