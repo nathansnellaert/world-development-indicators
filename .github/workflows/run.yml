@@ -1,88 +1,40 @@
 name: Run Connector
-'on':
+on:
   workflow_dispatch:
-    inputs:
-      mode:
-        description: 'Run mode'
-        required: true
-        default: 'prod'
-        type: choice
-        options:
-          - dev
-          - prod
-      continue_on_error:
-        description: 'Continue on snapshot errors'
-        required: false
-        default: true
-        type: boolean
-      no_state:
-        description: 'Force full run (ignore state)'
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: write  # Allow pushing commits back to the repository
-
 jobs:
   run:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
-      
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-        
     - name: Install uv
       uses: astral-sh/setup-uv@v4
       with:
         enable-cache: true
-        
     - name: Install dependencies
       run: uv sync
-      
-    - name: Commit and push any local changes
+    - name: Run connector
+      run: uv run python main.py
+      env:
+        PYTHONUNBUFFERED: 1
+        RUN_ID: ${{ github.run_id }}
+        STORAGE_BACKEND: iceberg
+        SUBSETS_API_KEY: ${{ secrets.SUBSETS_API_KEY }}
+        SUBSETS_CATALOG_URL: ${{ secrets.SUBSETS_CATALOG_URL }}
+        SUBSETS_WAREHOUSE: ${{ secrets.SUBSETS_WAREHOUSE }}
+    - name: Commit state files
+      if: always()  # Run regardless of success/failure
       run: |
         git config --global user.email "github-actions[bot]@users.noreply.github.com"
         git config --global user.name "github-actions[bot]"
         
-        # Check if there are any changes
-        if ! git diff --quiet HEAD; then
-          echo "Found uncommitted changes, committing and pushing..."
-          git add -A
-          git commit -m "Auto-commit before run ${{ github.run_id }}"
-          git push
-        else
-          echo "No uncommitted changes found"
-        fi
-        
-    - name: Run connector
-      run: |
-        # Extract connector name from repository name (format: data-connector-NAME)
-        CONNECTOR_NAME="${GITHUB_REPOSITORY#*/data-connector-}"
-        
-        FLAGS=""
-        if [[ "${{ inputs.continue_on_error }}" == "true" ]]; then
-          FLAGS="$FLAGS --continue-on-snapshot-error"
-        fi
-        if [[ "${{ inputs.no_state }}" == "true" ]]; then
-          FLAGS="$FLAGS --no-state"
-        fi
-        
-        python scripts/actions/${{ inputs.mode }}.py $CONNECTOR_NAME $FLAGS
-      env:
-        PYTHONUNBUFFERED: 1
-        GITHUB_RUN_ID: ${{ github.run_id }}
-        SUBSETS_API_KEY: ${{ secrets.SUBSETS_API_KEY }}
-        SUBSETS_CATALOG_URL: ${{ secrets.SUBSETS_CATALOG_URL }}
-        SUBSETS_WAREHOUSE: ${{ secrets.SUBSETS_WAREHOUSE }}
-        
-    - name: Commit state files
-      if: always()  # Run regardless of success/failure
-      run: |
         # Check if there are any changes to .state files
         if git diff --quiet HEAD -- '.state/**'; then
           echo "No state changes to commit"
