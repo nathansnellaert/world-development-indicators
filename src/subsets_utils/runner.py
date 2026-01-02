@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from .r2 import upload_bytes, upload_file, is_cloud_mode
@@ -132,7 +133,7 @@ def main():
     os.environ['CONNECTOR_NAME'] = connector_name
 
     # Setup
-    run_id = os.environ.get('RUN_ID', datetime.now().strftime('%Y%m%d-%H%M%S'))
+    run_id = os.environ.get('RUN_ID', datetime.now(ZoneInfo('UTC')).strftime('%Y%m%d-%H%M%S'))
 
     # Log directory: local uses connector's logs/, cloud uses /tmp/logs/
     if is_cloud_mode():
