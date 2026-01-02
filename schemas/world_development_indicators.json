@@ -1,0 +1,13 @@
+{
+  "id": "world_development_indicators",
+  "title": "World Development Indicators",
+  "description": "The World Bank's primary collection of development indicators, compiled from officially recognized international sources. Contains time series data for over 1,400 indicators covering economic, social, and environmental development metrics for countries and regions worldwide from 1960 to present.",
+  "columns": {
+    "country_name": "Full name of the country or region",
+    "country_code2": "ISO 3166-1 alpha-2 country code (2-letter code)",
+    "indicator_name": "Full descriptive name of the development indicator",
+    "indicator_code": "Unique World Bank identifier code for the indicator",
+    "year": "Year of the observation (1960-present)",
+    "value": "Numeric value of the indicator for the given country and year"
+  }
+}

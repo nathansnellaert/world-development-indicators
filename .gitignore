@@ -1,0 +1,20 @@
+data
+dev.py
+.venv
+# Only track production state
+.state/
+!.state/prod/
+http_cache/
+logs/
+
+# Synced from template
+
+# Cache and logs
+# Development files
+# Output data (subsets is published, raw is local cache)
+# Python environment
+# State (keep prod state for tracking)
+.venv/
+__pycache__/
+data/raw/
+dev/

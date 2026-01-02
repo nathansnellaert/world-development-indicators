@@ -1,0 +1,11 @@
+{
+  "id": "world_development_indicators_observation_metadata",
+  "title": "World Development Indicators - Observation Metadata",
+  "description": "Footnotes and annotations for specific data points in the World Development Indicators, providing important context about individual observations such as data quality issues, estimation methods, or breaks in series.",
+  "columns": {
+    "country_code2": "ISO 3166-1 alpha-2 country code (2-letter code)",
+    "series_code": "Unique World Bank identifier code for the indicator series",
+    "year": "Year of the observation that the metadata applies to",
+    "description": "Footnote or annotation text explaining data quality, estimation methods, or other important context for this specific observation"
+  }
+}

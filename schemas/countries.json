@@ -1,0 +1,79 @@
+{
+  "id": "wb_countries",
+  "title": "World Bank Countries",
+  "description": "Countries and regions covered by the World Bank, including metadata such as country codes, income levels, and geographic regions.",
+  "license": "CC-BY-4.0",
+  "source_id": "world_bank",
+  "columns": [
+    {
+      "id": "country_code",
+      "description": "World Bank country code (3-letter)",
+      "type": "string",
+      "nullable": false,
+      "unique": true
+    },
+    {
+      "id": "iso2_code",
+      "description": "ISO 3166-1 alpha-2 country code",
+      "type": "string",
+      "nullable": true,
+      "unique": false
+    },
+    {
+      "id": "country_name",
+      "description": "Full name of the country or region",
+      "type": "string",
+      "nullable": false,
+      "unique": false
+    },
+    {
+      "id": "capital_city",
+      "description": "Capital city of the country",
+      "type": "string",
+      "nullable": true,
+      "unique": false
+    },
+    {
+      "id": "region_code",
+      "description": "World Bank region code",
+      "type": "string",
+      "nullable": true,
+      "unique": false
+    },
+    {
+      "id": "region_name",
+      "description": "World Bank region name",
+      "type": "string",
+      "nullable": true,
+      "unique": false
+    },
+    {
+      "id": "income_level_code",
+      "description": "World Bank income level classification code",
+      "type": "string",
+      "nullable": true,
+      "unique": false
+    },
+    {
+      "id": "income_level_name",
+      "description": "World Bank income level classification name",
+      "type": "string",
+      "nullable": true,
+      "unique": false
+    },
+    {
+      "id": "lending_type_code",
+      "description": "World Bank lending type code",
+      "type": "string",
+      "nullable": true,
+      "unique": false
+    },
+    {
+      "id": "lending_type_name",
+      "description": "World Bank lending type name",
+      "type": "string",
+      "nullable": true,
+      "unique": false
+    }
+  ]
+}

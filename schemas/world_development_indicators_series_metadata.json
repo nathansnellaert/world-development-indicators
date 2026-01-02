@@ -1,0 +1,23 @@
+{
+  "id": "world_development_indicators_series_metadata",
+  "title": "World Development Indicators - Series Metadata",
+  "description": "Comprehensive metadata for all World Development Indicator series, including definitions, sources, methodologies, and measurement details. Essential reference for understanding what each indicator measures and how it's calculated.",
+  "columns": {
+    "indicator_code": "Unique World Bank identifier code for the indicator",
+    "indicator_name": "Full descriptive name of the development indicator",
+    "short_definition": "Brief description of what the indicator measures",
+    "long_definition": "Detailed explanation of the indicator and its significance",
+    "unit_of_measure": "Unit in which the indicator is measured (e.g., percentage, USD, count)",
+    "periodicity": "Frequency of data collection (e.g., Annual, Quarterly)",
+    "base_period": "Reference period for index-based indicators",
+    "other_notes": "Additional notes about the indicator",
+    "aggregation_method": "Method used to aggregate data across countries or time periods",
+    "limitations_and_exceptions": "Known limitations, caveats, or exceptions in the data",
+    "notes_from_original_source": "Notes provided by the original data source",
+    "general_comments": "General comments about the indicator",
+    "source": "Organization or publication that is the source of the data",
+    "statistical_concept_and_methodology": "Detailed methodology used to calculate the indicator",
+    "development_relevance": "Explanation of why this indicator is relevant for development analysis",
+    "license_type": "License under which the data is distributed"
+  }
+}

@@ -1,0 +1,182 @@
+{
+  "wdi_agriculture_land": {
+    "title": "Agriculture Land Use",
+    "description": "Land area statistics for agricultural activities including arable land, permanent crops, and agricultural land as share of total land area."
+  },
+  "wdi_agriculture_production": {
+    "title": "Agriculture Production",
+    "description": "Agricultural production metrics covering crops, cereals, aquaculture, fisheries, and production indices."
+  },
+  "wdi_balance_of_payments": {
+    "title": "Balance of Payments",
+    "description": "International financial flows including current account, capital account, and balance of payments transactions."
+  },
+  "wdi_business_environment": {
+    "title": "Business Environment",
+    "description": "Indicators measuring the regulatory and institutional environment for private sector activity and business operations."
+  },
+  "wdi_economic_growth": {
+    "title": "Economic Growth",
+    "description": "Annual economic growth rates and growth trends across various economic measures and sectors."
+  },
+  "wdi_education_attainment_literacy": {
+    "title": "Education Attainment and Literacy",
+    "description": "Educational achievement levels, literacy rates, and population distribution by completed education levels."
+  },
+  "wdi_education_enrollment": {
+    "title": "Education Enrollment",
+    "description": "School enrollment statistics across preprimary, primary, secondary, and tertiary education levels."
+  },
+  "wdi_education_quality_expenditure": {
+    "title": "Education Quality and Expenditure",
+    "description": "Education spending, pupil-teacher ratios, teachers, and other quality indicators for education systems."
+  },
+  "wdi_employment_by_sector": {
+    "title": "Employment by Sector",
+    "description": "Employment distribution across agriculture, industry, and services sectors by gender and economic activity."
+  },
+  "wdi_energy_consumption": {
+    "title": "Energy Consumption",
+    "description": "Energy use indicators including total consumption, per capita usage, and consumption by energy source."
+  },
+  "wdi_energy_production": {
+    "title": "Energy Production",
+    "description": "Energy production statistics covering electricity generation, renewable energy production, and fossil fuel output."
+  },
+  "wdi_environment_emissions": {
+    "title": "Environmental Emissions",
+    "description": "Greenhouse gas emissions, CO2 emissions, and other environmental pollutant indicators by source and sector."
+  },
+  "wdi_environment_resources": {
+    "title": "Environmental Resources",
+    "description": "Natural resource indicators including freshwater resources, forest coverage, protected areas, and biodiversity measures."
+  },
+  "wdi_fertility_mortality": {
+    "title": "Fertility and Mortality",
+    "description": "Birth rates, death rates, fertility rates, infant mortality, and life expectancy indicators."
+  },
+  "wdi_financial_sector_access": {
+    "title": "Financial Sector Access",
+    "description": "Financial inclusion metrics measuring access to banking, credit, savings, and other financial services."
+  },
+  "wdi_financial_sector_markets": {
+    "title": "Financial Sector Markets",
+    "description": "Stock market capitalization, trading volumes, bond markets, and other capital market indicators."
+  },
+  "wdi_financial_sector_stability": {
+    "title": "Financial Sector Stability",
+    "description": "Banking sector soundness indicators, capital adequacy ratios, non-performing loans, and financial stability metrics."
+  },
+  "wdi_gdp_national_accounts": {
+    "title": "GDP and National Accounts",
+    "description": "Gross domestic product by expenditure approach, income approach, and national accounts aggregates."
+  },
+  "wdi_gdp_per_capita": {
+    "title": "GDP per Capita",
+    "description": "GDP per person measures in current and constant prices, PPP-adjusted, and growth rates."
+  },
+  "wdi_gender_women_empowerment": {
+    "title": "Gender and Women's Empowerment",
+    "description": "Gender equality indicators covering economic participation, political representation, education gaps, and women's rights."
+  },
+  "wdi_governance_rule_of_law": {
+    "title": "Governance and Rule of Law",
+    "description": "Governance quality indicators including corruption control, regulatory quality, government effectiveness, and rule of law."
+  },
+  "wdi_health_disease_prevention": {
+    "title": "Health Disease and Prevention",
+    "description": "Disease prevalence, immunization coverage, and prevention measures for communicable and non-communicable diseases."
+  },
+  "wdi_health_expenditure": {
+    "title": "Health Expenditure",
+    "description": "Healthcare spending as share of GDP, government health expenditure, out-of-pocket spending, and per capita health costs."
+  },
+  "wdi_health_nutrition": {
+    "title": "Health and Nutrition",
+    "description": "Malnutrition indicators including stunting, wasting, underweight children, and micronutrient deficiencies."
+  },
+  "wdi_health_reproductive": {
+    "title": "Health Reproductive",
+    "description": "Reproductive health indicators including maternal mortality, contraceptive prevalence, and reproductive healthcare access."
+  },
+  "wdi_health_services": {
+    "title": "Health Services",
+    "description": "Healthcare infrastructure metrics covering hospitals, physicians, nurses, hospital beds, and health service delivery."
+  },
+  "wdi_income_inequality": {
+    "title": "Income Inequality",
+    "description": "Income distribution measures including Gini coefficients, income shares by quintile, and wealth concentration."
+  },
+  "wdi_inflation_prices": {
+    "title": "Inflation and Prices",
+    "description": "Consumer price indices, inflation rates, GDP deflators, and price level changes."
+  },
+  "wdi_infrastructure_transport": {
+    "title": "Infrastructure Transport",
+    "description": "Transportation infrastructure including road networks, railways, airports, ports, and freight transport statistics."
+  },
+  "wdi_infrastructure_utilities": {
+    "title": "Infrastructure Utilities",
+    "description": "Utility infrastructure covering electricity access, water supply, sanitation facilities, and telecommunications networks."
+  },
+  "wdi_labor_force_participation": {
+    "title": "Labor Force Participation",
+    "description": "Labor force participation rates, employment-to-population ratios, and workforce composition by age and gender."
+  },
+  "wdi_migration_refugees": {
+    "title": "Migration and Refugees",
+    "description": "International migration flows, refugee populations, internally displaced persons, and remittance data."
+  },
+  "wdi_population_dynamics": {
+    "title": "Population Dynamics",
+    "description": "Total population, population growth rates, age structure, dependency ratios, and urbanization trends."
+  },
+  "wdi_poverty_headcount": {
+    "title": "Poverty Headcount",
+    "description": "Poverty rates measured at international poverty lines and national poverty thresholds across income levels."
+  },
+  "wdi_ppp_economics": {
+    "title": "PPP Economics",
+    "description": "Purchasing power parity conversion factors, price level indices, and PPP-adjusted economic measures."
+  },
+  "wdi_public_debt": {
+    "title": "Public Debt",
+    "description": "Government debt levels, debt-to-GDP ratios, external debt, and debt service indicators."
+  },
+  "wdi_public_finance_expenditure": {
+    "title": "Public Finance Expenditure",
+    "description": "Government spending by function including education, health, defense, and social protection expenditures."
+  },
+  "wdi_public_finance_revenue": {
+    "title": "Public Finance Revenue",
+    "description": "Government revenue sources including tax revenues, non-tax revenues, and grants as shares of GDP."
+  },
+  "wdi_social_protection_safety_nets": {
+    "title": "Social Protection and Safety Nets",
+    "description": "Social assistance programs, unemployment benefits, pension coverage, and safety net program statistics."
+  },
+  "wdi_technology_ict_usage": {
+    "title": "Technology ICT Usage",
+    "description": "Information and communication technology indicators including internet penetration, mobile subscriptions, and broadband access."
+  },
+  "wdi_technology_innovation_rd": {
+    "title": "Technology Innovation and R&D",
+    "description": "Research and development expenditure, patent applications, scientific publications, and innovation capacity measures."
+  },
+  "wdi_trade_merchandise_exports": {
+    "title": "Trade Merchandise Exports",
+    "description": "Merchandise export values, composition by product category, and export concentration measures."
+  },
+  "wdi_trade_merchandise_imports": {
+    "title": "Trade Merchandise Imports",
+    "description": "Merchandise import values, composition by product category, and import dependency indicators."
+  },
+  "wdi_trade_services": {
+    "title": "Trade Services",
+    "description": "Service trade statistics including travel, transport, financial services, and other commercial service exports and imports."
+  },
+  "wdi_unemployment_youth": {
+    "title": "Unemployment Youth",
+    "description": "Youth unemployment rates for ages 15-24, NEET rates, and youth labor market indicators by gender."
+  }
+}

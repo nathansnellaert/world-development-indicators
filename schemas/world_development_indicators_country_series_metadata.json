@@ -1,0 +1,10 @@
+{
+  "id": "world_development_indicators_country_series_metadata",
+  "title": "World Development Indicators - Country-Series Metadata",
+  "description": "Country-specific metadata for World Development Indicators, providing additional context and notes about how indicators apply to specific countries or regions.",
+  "columns": {
+    "country_code2": "ISO 3166-1 alpha-2 country code (2-letter code)",
+    "indicator_code": "Unique World Bank identifier code for the indicator",
+    "description": "Country-specific notes, exceptions, or clarifications about the indicator data"
+  }
+}
