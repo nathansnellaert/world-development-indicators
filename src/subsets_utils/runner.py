@@ -23,6 +23,7 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from .r2 import upload_bytes, upload_file, is_cloud_mode
+from . import debug
 
 
 class MemoryProfiler:
@@ -109,18 +110,26 @@ def upload_logs(log_dir: Path, run_id: str, connector_name: str):
             print(f"  Failed to upload {log_file.name}: {e}")
 
 
-def write_error_log(log_dir: Path, exit_code: int, error_type: str, message: str):
-    """Write an error summary to the log directory."""
-    error_file = log_dir / "error.json"
-    import json
+def write_error_log(log_dir: Path, exit_code: int, output_file: Path, tail_lines: int = 100):
+    """Write the last N lines of output as error.txt."""
+    error_file = log_dir / "error.txt"
+
+    if not output_file.exists():
+        with open(error_file, 'w') as f:
+            f.write(f"Exit code: {exit_code}\nNo output captured.\n")
+        return
+
+    # Read last N lines
+    with open(output_file, 'r') as f:
+        lines = f.readlines()
+
+    tail = lines[-tail_lines:] if len(lines) > tail_lines else lines
+
     with open(error_file, 'w') as f:
-        json.dump({
-            "timestamp": datetime.now().isoformat(),
-            "exit_code": exit_code,
-            "error_type": error_type,
-            "message": message,
-            "run_id": os.environ.get('RUN_ID', 'unknown')
-        }, f, indent=2)
+        f.write(f"Exit code: {exit_code}\n")
+        f.write(f"Last {len(tail)} lines of output:\n")
+        f.write("-" * 60 + "\n")
+        f.writelines(tail)
 
 
 def main():
@@ -155,40 +164,54 @@ def main():
     print(f"Command: {' '.join(cmd)}")
     print("-" * 60)
 
+    # Log run start
+    debug.log_run_start()
+
     # Set up environment with src in PYTHONPATH so 'from subsets_utils' works
     env = os.environ.copy()
     src_path = str(Path.cwd() / "src")
     env["PYTHONPATH"] = src_path + (":" + env["PYTHONPATH"] if "PYTHONPATH" in env else "")
 
-    # Start subprocess
-    process = subprocess.Popen(
-        cmd,
-        stdout=sys.stdout,
-        stderr=sys.stderr,
-        env=env
-    )
+    # Output file for capturing logs (used for error.txt on failure)
+    output_file = log_dir / "output.log"
 
-    # Start memory profiler
-    profiler = MemoryProfiler(process.pid, log_dir)
-    profiler.start()
+    # Start subprocess with output captured to file AND streamed to console
+    with open(output_file, 'w') as log_f:
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True,
+            bufsize=1  # Line buffered
+        )
 
-    # Signal handler for SIGTERM (GitHub timeout)
-    def handle_sigterm(signum, frame):
-        print(f"\nReceived SIGTERM, terminating child...")
-        process.terminate()
+        # Start memory profiler
+        profiler = MemoryProfiler(process.pid, log_dir)
+        profiler.start()
+
+        # Signal handler for SIGTERM (GitHub timeout)
+        def handle_sigterm(signum, frame):
+            print(f"\nReceived SIGTERM, terminating child...")
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+
+        signal.signal(signal.SIGTERM, handle_sigterm)
+
+        # Stream output to both console and file
         try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
+            for line in process.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                log_f.write(line)
+                log_f.flush()
+        except KeyboardInterrupt:
+            print("\nInterrupted, terminating child...")
+            process.terminate()
 
-    signal.signal(signal.SIGTERM, handle_sigterm)
-
-    # Wait for subprocess
-    try:
-        exit_code = process.wait()
-    except KeyboardInterrupt:
-        print("\nInterrupted, terminating child...")
-        process.terminate()
         exit_code = process.wait()
 
     # Stop profiler
@@ -199,15 +222,19 @@ def main():
 
     if exit_code == 0:
         print(f"Connector completed successfully")
+        debug.log_run_end(status="completed")
     elif exit_code == 137:
         print(f"Connector killed by OOM (exit code 137)")
-        write_error_log(log_dir, exit_code, "OOM", "Process killed by OOM killer (SIGKILL)")
+        write_error_log(log_dir, exit_code, output_file)
+        debug.log_run_end(status="oom", error="Exit code 137 - Out of memory")
     elif exit_code == 143:
         print(f"Connector terminated by SIGTERM (exit code 143)")
-        write_error_log(log_dir, exit_code, "SIGTERM", "Process terminated by signal")
+        write_error_log(log_dir, exit_code, output_file)
+        debug.log_run_end(status="timeout", error="Exit code 143 - SIGTERM")
     else:
         print(f"Connector failed with exit code {exit_code}")
-        write_error_log(log_dir, exit_code, "Error", f"Process exited with code {exit_code}")
+        write_error_log(log_dir, exit_code, output_file)
+        debug.log_run_end(status="failed", error=f"Exit code {exit_code}")
 
     # Always upload logs
     if is_cloud_mode():
