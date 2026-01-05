@@ -1,6 +1,5 @@
 import os
 import csv
-import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -133,12 +132,3 @@ def log_state_change(asset, old_state, new_state):
             }, ["timestamp", "run_id", "asset", "key", "old_value", "new_value"])
 
 
-def log_error(error: Exception, context: str = ""):
-    _append_csv("errors.csv", {
-        "timestamp": datetime.now().isoformat(),
-        "run_id": os.environ.get('RUN_ID', 'unknown'),
-        "error_type": type(error).__name__,
-        "message": str(error),
-        "context": context,
-        "traceback": traceback.format_exc().replace('\n', '\\n')
-    }, ["timestamp", "run_id", "error_type", "message", "context", "traceback"])

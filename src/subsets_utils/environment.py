@@ -6,16 +6,22 @@ def is_cloud_mode() -> bool:
     return os.environ.get('CI', '').lower() == 'true'
 
 
-def validate_environment():
+def validate_environment(additional_required: list[str] = None):
     """Validate required environment variables based on execution mode.
 
     Local mode: requires DATA_DIR
     Cloud mode: requires R2 credentials
+
+    Args:
+        additional_required: Optional list of additional env vars to require (e.g., API keys)
     """
     if is_cloud_mode():
         required = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET_NAME"]
     else:
         required = ["DATA_DIR"]
+
+    if additional_required:
+        required.extend(additional_required)
 
     missing = [var for var in required if var not in os.environ]
     if missing:

@@ -29,7 +29,7 @@ from . import debug
 class MemoryProfiler:
     """External memory profiler that monitors a subprocess from the parent."""
 
-    def __init__(self, pid: int, log_dir: Path, interval: float = 0.5):
+    def __init__(self, pid: int, log_dir: Path, interval: float = 10.0):
         self.pid = pid
         self.log_file = log_dir / "memory.csv"
         self.interval = interval
@@ -143,6 +143,7 @@ def main():
 
     # Setup
     run_id = os.environ.get('RUN_ID', datetime.now(ZoneInfo('UTC')).strftime('%Y%m%d-%H%M%S'))
+    os.environ['RUN_ID'] = run_id  # Propagate to subprocess
 
     # Log directory: local uses connector's logs/, cloud uses /tmp/logs/
     if is_cloud_mode():
@@ -223,6 +224,9 @@ def main():
     if exit_code == 0:
         print(f"Connector completed successfully")
         debug.log_run_end(status="completed")
+    elif exit_code == 2:
+        print(f"Connector needs continuation (exit code 2) - will retrigger")
+        debug.log_run_end(status="continuation")
     elif exit_code == 137:
         print(f"Connector killed by OOM (exit code 137)")
         write_error_log(log_dir, exit_code, output_file)
