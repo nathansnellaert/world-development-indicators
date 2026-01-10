@@ -8,7 +8,7 @@ from collections import defaultdict
 import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
-from subsets_utils import load_raw_file, upload_data, publish
+from subsets_utils import load_raw_file, sync_data, sync_metadata
 
 
 def clean_year_str(year_str: str) -> int:
@@ -142,8 +142,21 @@ def process_wdi_series(df: pa.Table, country_mapping: pa.Table) -> pa.Table:
     return final_table
 
 
-def transform_to_wide_format(table: pa.Table, indicator_summaries: dict) -> pa.Table:
-    """Transform long format table to wide format where each indicator becomes a column."""
+# Common column descriptions used across all WDI datasets
+COMMON_COLUMN_DESCRIPTIONS = {
+    "country_name": "Country name from World Bank database",
+    "country_code2": "ISO 3166-1 alpha-2 country code",
+    "year": "Observation year",
+}
+
+
+def transform_to_wide_format(table: pa.Table, indicator_summaries: dict) -> tuple[pa.Table, dict]:
+    """Transform long format table to wide format where each indicator becomes a column.
+
+    Returns:
+        tuple: (wide_table, column_descriptions) where column_descriptions is a dict
+               mapping column names to their descriptions for metadata.
+    """
     indicator_to_column = load_indicator_to_column_mapping()
 
     df = table.to_pandas()
@@ -164,13 +177,18 @@ def transform_to_wide_format(table: pa.Table, indicator_summaries: dict) -> pa.T
     for idx, row in df[['column_name', 'indicator_code']].drop_duplicates().iterrows():
         column_to_code[row['column_name']] = row['indicator_code']
 
+    # Build column descriptions dict for metadata
+    column_descriptions = {}
+
     schema_fields = []
     for field in wide_table.schema:
-        if field.name in ['country_name', 'country_code2', 'year']:
+        if field.name in COMMON_COLUMN_DESCRIPTIONS:
+            column_descriptions[field.name] = COMMON_COLUMN_DESCRIPTIONS[field.name]
             schema_fields.append(field)
         elif field.name in column_to_code:
             indicator_code = column_to_code[field.name]
             if indicator_code in indicator_summaries:
+                column_descriptions[field.name] = indicator_summaries[indicator_code]
                 new_field = pa.field(
                     field.name,
                     field.type,
@@ -185,7 +203,7 @@ def transform_to_wide_format(table: pa.Table, indicator_summaries: dict) -> pa.T
     new_schema = pa.schema(schema_fields)
     wide_table = wide_table.cast(new_schema)
 
-    return wide_table
+    return wide_table, column_descriptions
 
 
 def split_wdi_by_tables(wdi_data: pa.Table) -> dict[str, pa.Table]:
@@ -273,19 +291,20 @@ def run():
     for table_name, table_data in tables_long.items():
         if table_name.startswith('wdi_'):
             print(f"Transforming {table_name} to wide format...")
-            wide_table = transform_to_wide_format(table_data, indicator_summaries)
+            wide_table, column_descriptions = transform_to_wide_format(table_data, indicator_summaries)
             print(f"  {table_name}: {len(wide_table):,} rows x {len(wide_table.schema)} columns")
 
             if len(wide_table) > 0:
-                upload_data(wide_table, table_name)
+                sync_data(wide_table, table_name)
 
                 if table_name in table_metadata:
-                    publish(table_name, {
+                    sync_metadata(table_name, {
                         "id": table_name,
                         "title": table_metadata[table_name]["title"],
-                        "description": table_metadata[table_name]["description"]
+                        "description": table_metadata[table_name]["description"],
+                        "column_descriptions": column_descriptions
                     })
                     print(f"Published metadata for {table_name}")
         else:
             if len(table_data) > 0:
-                upload_data(table_data, table_name)
+                sync_data(table_data, table_name)
