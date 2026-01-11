@@ -8,8 +8,16 @@ Usage:
         transform: [ingest],
     })
 
-    workflow.run()
-    print(workflow.to_json())
+    workflow.run()                        # Run all nodes
+    workflow.run(targets=["transform"])   # Run single node (assumes deps ran)
+
+CLI pattern for main.py:
+    if __name__ == "__main__":
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--target", help="Run specific node")
+        args = parser.parse_args()
+        workflow.run(targets=[args.target] if args.target else None)
 """
 import json
 import os
@@ -156,13 +164,27 @@ class DAG:
 
         return task_state
 
-    def run(self, isolate: bool = False):
+    def run(self, isolate: bool = False, targets: list[str] | None = None):
         """Execute all tasks in dependency order.
 
         Args:
             isolate: Run each task in subprocess for memory isolation
+            targets: Optional list of node names to run (assumes deps already ran)
         """
         order = self._topological_order()
+
+        # Filter to targets if specified
+        if targets:
+            target_set = set(targets)
+            order = [fn for fn in order if self._fn_to_id[fn].split(".")[-2] in target_set]
+            if not order:
+                # Try matching full ID or function name
+                order = [fn for fn in self._topological_order()
+                         if self._fn_to_id[fn] in target_set or fn.__name__ in target_set]
+            if not order:
+                print(f"[DAG] No nodes matched targets: {targets}")
+                print(f"[DAG] Available: {[self._fn_to_id[fn] for fn in self.nodes]}")
+                return self
 
         for fn in order:
             task_id = self._fn_to_id[fn]
@@ -178,7 +200,7 @@ class DAG:
 
             print(f"[DAG] Running {task_id}...")
             result = self._run_task(fn, isolate=isolate)
-            self._save_state()  # Implicit checkpoint after each node
+            self.save_state()  # Implicit checkpoint after each node
 
             if result["status"] == "done":
                 print(f"[DAG] {task_id} done ({result['duration_s']:.1f}s)")
@@ -213,8 +235,8 @@ class DAG:
             return "done"
         return "pending"
 
-    def _save_state(self):
-        """Save execution state to LOG_DIR (implicit, called after each node)."""
+    def save_state(self):
+        """Save execution state to LOG_DIR. Called after each node, can also be called explicitly."""
         log_dir = os.environ.get('LOG_DIR')
         if not log_dir:
             return  # No LOG_DIR = local dev without runner, skip
