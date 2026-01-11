@@ -33,7 +33,10 @@ def run():
                     csv_stream = io.BytesIO(csv_bytes)
                     table = pv.read_csv(
                         csv_stream,
-                        parse_options=pv.ParseOptions(invalid_row_handler=lambda _: 'skip')
+                        parse_options=pv.ParseOptions(
+                            invalid_row_handler=lambda _: 'skip',
+                            newlines_in_values=True
+                        )
                     )
                     asset_id = file_info.filename.replace('.csv', '').lower()
                     save_raw_parquet(table, asset_id)
