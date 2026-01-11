@@ -22,7 +22,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
-from .r2 import upload_bytes, upload_file, is_cloud_mode
+from .r2 import upload_bytes, upload_file, _is_cloud_mode
 from . import debug
 
 
@@ -146,7 +146,7 @@ def main():
     os.environ['RUN_ID'] = run_id  # Propagate to subprocess
 
     # Log directory: local uses connector's logs/, cloud uses /tmp/logs/
-    if is_cloud_mode():
+    if _is_cloud_mode():
         log_dir = Path("/tmp/logs") / run_id
     else:
         log_dir = Path("logs") / run_id
@@ -241,7 +241,7 @@ def main():
         debug.log_run_end(status="failed", error=f"Exit code {exit_code}")
 
     # Always upload logs
-    if is_cloud_mode():
+    if _is_cloud_mode():
         upload_logs(log_dir, run_id, connector_name)
 
     sys.exit(exit_code)

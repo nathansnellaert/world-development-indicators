@@ -7,7 +7,7 @@ from typing import Optional
 _s3_client = None
 
 
-def is_cloud_mode() -> bool:
+def _is_cloud_mode() -> bool:
     return os.environ.get('CI', '').lower() == 'true'
 
 
@@ -86,3 +86,15 @@ def get_storage_options() -> dict:
 def get_delta_table_uri(dataset_name: str) -> str:
     """Get the S3 URI for a Delta table."""
     return f"s3://{get_bucket_name()}/{get_connector_name()}/data/subsets/{dataset_name}"
+
+
+def list_keys(prefix: str) -> list[str]:
+    """List all keys in R2 with the given prefix."""
+    client = get_s3_client()
+    bucket = get_bucket_name()
+    keys = []
+    paginator = client.get_paginator('list_objects_v2')
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get('Contents', []):
+            keys.append(obj['Key'])
+    return keys

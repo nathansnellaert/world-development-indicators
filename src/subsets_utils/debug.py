@@ -3,7 +3,7 @@ import csv
 from datetime import datetime
 from pathlib import Path
 
-from .r2 import is_cloud_mode
+from .r2 import _is_cloud_mode
 
 _log_dir = None
 _run_timestamp = None
@@ -28,7 +28,7 @@ def _get_log_dir() -> Path:
         # Check for explicit LOG_DIR (set by runner.py)
         if os.environ.get('LOG_DIR'):
             _log_dir = Path(os.environ['LOG_DIR'])
-        elif is_cloud_mode():
+        elif _is_cloud_mode():
             _log_dir = Path("/tmp/logs") / _get_run_timestamp()
         else:
             _log_dir = Path("logs") / _get_run_timestamp()
@@ -65,20 +65,28 @@ def log_http_request(method, url, status_code, duration_ms=None, error=None, **k
 
 
 def log_data_output(dataset_name, row_count, size_bytes, columns=None, null_counts=None, **kwargs):
+    """Log dataset output metadata.
+
+    Args:
+        dataset_name: Name of the dataset
+        row_count: Number of rows
+        size_bytes: Size in bytes
+        columns: List of column names (only count is logged, not names)
+        null_counts: Deprecated, ignored
+    """
     _append_csv("data_outputs.csv", {
         "timestamp": datetime.now().isoformat(),
         "run_id": os.environ.get('RUN_ID', 'unknown'),
         "dataset": dataset_name,
         "rows": row_count,
         "size_bytes": size_bytes,
-        "columns": ",".join(columns) if columns else "",
-        "null_counts": str(null_counts) if null_counts else ""
-    }, ["timestamp", "run_id", "dataset", "rows", "size_bytes", "columns", "null_counts"])
+        "column_count": len(columns) if columns else 0,
+    }, ["timestamp", "run_id", "dataset", "rows", "size_bytes", "column_count"])
 
 
 def log_run_start():
     # Detect environment (cloud vs local)
-    environment = "cloud" if is_cloud_mode() else "local"
+    environment = "cloud" if _is_cloud_mode() else "local"
 
     # Detect trigger (GitHub sets GITHUB_EVENT_NAME for Actions)
     trigger = os.environ.get('GITHUB_EVENT_NAME', 'manual')
@@ -96,7 +104,7 @@ def log_run_start():
 
 def log_run_end(status="completed", error=None):
     # Detect environment (cloud vs local)
-    environment = "cloud" if is_cloud_mode() else "local"
+    environment = "cloud" if _is_cloud_mode() else "local"
 
     # Detect trigger
     trigger = os.environ.get('GITHUB_EVENT_NAME', 'manual')
