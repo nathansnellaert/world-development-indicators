@@ -1,0 +1,10 @@
+{
+  "id": "world_development_indicators_series_year_metadata",
+  "title": "World Development Indicators - Series-Year Metadata",
+  "description": "Time-specific metadata for World Development Indicator series, documenting methodological changes, data revisions, or important events affecting the indicator in specific years.",
+  "columns": {
+    "indicator_code": "Unique World Bank identifier code for the indicator",
+    "year": "Year that the metadata applies to",
+    "description": "Notes about methodological changes, data revisions, or important context for the indicator in this specific year"
+  }
+}

@@ -1,0 +1,44 @@
+name: Run Connector
+on:
+  workflow_dispatch:
+    inputs:
+      dag_target:
+        description: 'Run specific DAG nodes (comma-separated)'
+        required: false
+        type: string
+      dag_on_failure:
+        description: 'Failure behavior: crash (default) or continue'
+        required: false
+        type: string
+        default: 'crash'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+    - uses: astral-sh/setup-uv@v4
+      with:
+        enable-cache: true
+    - run: uv sync
+
+    - name: Run connector
+      run: uv run python -m src.subsets_utils.runner
+      env:
+        PYTHONUNBUFFERED: 1
+        CI: 'true'
+        ENABLE_LOGGING: 'true'
+        GITHUB_CONNECTOR_URL: 'https://github.com/nathansnellaert/world-development-indicators'
+        R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+        R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+        R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        DAG_TARGET: ${{ inputs.dag_target }}
+        DAG_ON_FAILURE: ${{ inputs.dag_on_failure }}
