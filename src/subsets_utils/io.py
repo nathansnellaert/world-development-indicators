@@ -25,8 +25,28 @@ from . import debug
 from .config import (
     is_cloud, get_data_dir, get_storage_options, get_bucket_name,
     raw_uri, state_uri, subsets_uri, raw_key, state_key,
+    mirror_raw_path, mirror_state_path,
 )
 from .r2 import upload_bytes, download_bytes, head_object, list_keys
+
+
+# =============================================================================
+# Mirror fallback — dev mode reads from SSD mirror when local dev file missing
+# =============================================================================
+
+def _read_with_mirror_fallback(uri: str, mirror: Path | None) -> Optional[bytes]:
+    """Read a URI, falling back to the SSD mirror path if local read misses.
+
+    Only applies in local (dev) mode: s3:// URIs go straight through, and
+    writes never touch the mirror. This is the single read-time hook that
+    makes dev iterate without re-downloading data already in R2.
+    """
+    data = _read_bytes(uri)
+    if data is not None:
+        return data
+    if uri.startswith("s3://") or mirror is None:
+        return None
+    return mirror.read_bytes() if mirror.exists() else None
 
 
 # =============================================================================
@@ -101,7 +121,7 @@ def load_asset(asset_name: str) -> pa.Table:
 def load_state(asset: str) -> dict:
     """Load state for an asset. Returns empty dict if not found."""
     uri = state_uri(asset)
-    data = _read_bytes(uri)
+    data = _read_with_mirror_fallback(uri, mirror_state_path(asset))
     if not data:
         return {}
     return json.loads(data.decode("utf-8"))
@@ -143,7 +163,7 @@ def load_raw_file(asset_id: str, extension: str = "txt") -> str | bytes:
     """Load a raw file. Returns str if utf-8 decodable, else bytes."""
     from .tracking import record_read
     uri = raw_uri(asset_id, extension)
-    data = _read_bytes(uri)
+    data = _read_with_mirror_fallback(uri, mirror_raw_path(asset_id, extension))
     if data is None:
         raise FileNotFoundError(f"Raw asset '{asset_id}.{extension}' not found at {uri}")
     record_read(f"raw/{asset_id}.{extension}")
@@ -181,7 +201,7 @@ def load_raw_json(asset_id: str):
     from .tracking import record_read
     for ext in ("json", "json.gz"):
         uri = raw_uri(asset_id, ext)
-        data = _read_bytes(uri)
+        data = _read_with_mirror_fallback(uri, mirror_raw_path(asset_id, ext))
         if data is None:
             continue
         record_read(f"raw/{asset_id}.{ext}")
@@ -214,7 +234,7 @@ def load_raw_parquet(asset_id: str) -> pa.Table:
     """Load a Parquet file as PyArrow table."""
     from .tracking import record_read
     uri = raw_uri(asset_id, "parquet")
-    data = _read_bytes(uri)
+    data = _read_with_mirror_fallback(uri, mirror_raw_path(asset_id, "parquet"))
     if data is None:
         raise FileNotFoundError(f"Raw parquet '{asset_id}' not found at {uri}")
     record_read(f"raw/{asset_id}.parquet")
@@ -261,6 +281,10 @@ def get_r2_base_for_raw() -> str:
 def raw_asset_exists(asset_id: str, ext: str = "parquet", max_age_days: int | None = None) -> bool:
     """Check if a raw asset exists. Optionally check it is fresh enough.
 
+    In dev mode, checks both the local dev dir AND the SSD mirror — either
+    one counts as "exists". This keeps download-if-missing nodes from
+    re-downloading data already present in the mirror.
+
     Args:
         max_age_days: If set, returns False if the asset is older than this many days.
     """
@@ -273,13 +297,19 @@ def raw_asset_exists(asset_id: str, ext: str = "parquet", max_age_days: int | No
             age = datetime.now(timezone.utc) - meta["LastModified"]
             return age < timedelta(days=max_age_days)
         return True
-    p = Path(uri)
-    if not p.exists():
-        return False
-    if max_age_days is not None:
-        age = datetime.now() - datetime.fromtimestamp(p.stat().st_mtime)
-        return age < timedelta(days=max_age_days)
-    return True
+
+    def _check(p: Path) -> bool:
+        if not p.exists():
+            return False
+        if max_age_days is not None:
+            age = datetime.now() - datetime.fromtimestamp(p.stat().st_mtime)
+            return age < timedelta(days=max_age_days)
+        return True
+
+    if _check(Path(uri)):
+        return True
+    mirror = mirror_raw_path(asset_id, ext)
+    return mirror is not None and _check(mirror)
 
 
 def get_raw_path(asset_id: str, ext: str = "parquet") -> str:

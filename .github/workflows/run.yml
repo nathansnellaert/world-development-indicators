@@ -11,6 +11,10 @@ on:
         required: false
         type: string
         default: 'crash'
+      run_id:
+        description: 'Run ID for grouping continuation invocations'
+        required: false
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -42,3 +46,4 @@ jobs:
         R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
         DAG_TARGET: ${{ inputs.dag_target }}
         DAG_ON_FAILURE: ${{ inputs.dag_on_failure }}
+        PARENT_RUN_ID: ${{ inputs.run_id }}
