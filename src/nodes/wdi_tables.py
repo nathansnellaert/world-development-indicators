@@ -173,43 +173,54 @@ def run():
 
         print(f"    {table_name}: {len(table_data):,} records")
 
-        # Transform to wide format using DuckDB PIVOT
-        # Create column name mapping
-        col_mapping = {}
-        for ind in indicators_for_table:
-            col_name = indicator_to_column.get(ind, ind)
-            col_mapping[ind] = col_name
-
-        # Register table for DuckDB query
-        duckdb.register('table_data', table_data)
-
-        # Get unique indicators in this table
-        unique_indicators = duckdb.sql("SELECT DISTINCT indicator_name FROM table_data").fetchall()
-        indicator_list = [row[0] for row in unique_indicators]
-
-        # Build dynamic PIVOT query
-        pivot_cols = []
-        for ind in indicator_list:
-            col_name = col_mapping.get(ind, ind.replace(' ', '_').replace(',', '').replace('(', '').replace(')', '').replace('%', 'pct').lower()[:60])
-            pivot_cols.append(f"first(CASE WHEN indicator_name = '{ind.replace(chr(39), chr(39)+chr(39))}' THEN value END) as \"{col_name}\"")
-
-        pivot_query = f"""
-            SELECT
-                country_name,
-                country_code2,
-                year,
-                {', '.join(pivot_cols)}
-            FROM table_data
-            WHERE country_code2 IS NOT NULL
-            GROUP BY country_name, country_code2, year
-            ORDER BY country_name, year
-        """
-
-        try:
-            wide_table = duckdb.sql(pivot_query).arrow()
-        except Exception as e:
-            print(f"      Error pivoting {table_name}: {e}")
+        # Drop rows without a country_code2 (aggregates that don't have an
+        # alpha-2 code). Matches the old `WHERE country_code2 IS NOT NULL`.
+        table_data = table_data.filter(pc.is_valid(table_data['country_code2']))
+        if len(table_data) == 0:
             continue
+
+        # Long → wide via explicit pyarrow joins. No aggregate: for each
+        # indicator, filter the long table down to its rows, rename the
+        # `value` column to the indicator's snake_case column name, and
+        # left-outer-join it onto a base of distinct (country, year) keys.
+        # Every join contributes exactly one column and preserves the
+        # source values cell-for-cell.
+        col_mapping = {
+            ind: indicator_to_column.get(ind, ind)
+            for ind in indicators_for_table
+        }
+
+        wide_table = (
+            table_data
+            .select(['country_name', 'country_code2', 'year'])
+            .group_by(['country_name', 'country_code2', 'year'])
+            .aggregate([])  # empty agg → distinct keys
+        )
+
+        indicator_list = [
+            ind for ind in indicators_for_table
+            if ind in col_mapping
+        ]
+        for ind in indicator_list:
+            col_name = col_mapping[ind]
+            sub = (
+                table_data
+                .filter(pc.equal(table_data['indicator_name'], ind))
+                .select(['country_name', 'country_code2', 'year', 'value'])
+            )
+            if len(sub) == 0:
+                continue
+            sub = sub.rename_columns(['country_name', 'country_code2', 'year', col_name])
+            wide_table = wide_table.join(
+                sub,
+                keys=['country_name', 'country_code2', 'year'],
+                join_type='left outer',
+            )
+
+        wide_table = wide_table.sort_by([
+            ('country_name', 'ascending'),
+            ('year', 'ascending'),
+        ])
 
         if len(wide_table) == 0:
             continue
@@ -219,21 +230,23 @@ def run():
         # Build column descriptions
         column_descriptions = dict(COMMON_COLUMN_DESCRIPTIONS)
 
-        # Map indicator codes to descriptions
-        code_to_desc = {}
-        for ind in indicator_list:
-            # Find indicator code for this indicator name
-            indicator_codes = duckdb.sql(f"""
-                SELECT DISTINCT indicator_code
-                FROM table_data
-                WHERE indicator_name = '{ind.replace(chr(39), chr(39)+chr(39))}'
-            """).fetchall()
-            if indicator_codes:
-                code = indicator_codes[0][0]
-                if code in indicator_summaries:
-                    col_name = col_mapping.get(ind)
-                    if col_name:
-                        column_descriptions[col_name] = indicator_summaries[code]
+        # Build one (indicator_name → indicator_code) map per segment via a
+        # single group_by, then look each up in indicator_summaries.
+        name_code_pairs = (
+            table_data
+            .select(['indicator_name', 'indicator_code'])
+            .group_by(['indicator_name', 'indicator_code'])
+            .aggregate([])
+        )
+        name_to_code = dict(zip(
+            name_code_pairs.column('indicator_name').to_pylist(),
+            name_code_pairs.column('indicator_code').to_pylist(),
+        ))
+        for ind_name, code in name_to_code.items():
+            if code in indicator_summaries:
+                col_name = col_mapping.get(ind_name)
+                if col_name:
+                    column_descriptions[col_name] = indicator_summaries[code]
 
         # Validate before upload
         test(wide_table, table_name)
@@ -252,8 +265,6 @@ def run():
         publish(table_name, metadata)
 
         transformed_tables.append(table_name)
-
-        duckdb.unregister('table_data')
 
     # Handle unmapped indicators
     mapped_indicators = set(indicator_mapping.keys())

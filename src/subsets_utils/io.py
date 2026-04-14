@@ -85,6 +85,19 @@ def _exists(uri: str) -> bool:
     return Path(uri).exists()
 
 
+def _delete(uri: str) -> None:
+    """Delete a URI (s3:// or local path). No-op if already absent."""
+    if uri.startswith("s3://"):
+        from .r2 import get_s3_client
+        import os
+        client = get_s3_client()
+        client.delete_object(Bucket=os.environ["R2_BUCKET_NAME"], Key=_s3_key_from_uri(uri))
+    else:
+        p = Path(uri)
+        if p.exists():
+            p.unlink()
+
+
 # =============================================================================
 # Hashing
 # =============================================================================
@@ -212,6 +225,14 @@ def load_raw_json(asset_id: str):
     raise FileNotFoundError(f"Raw JSON asset '{asset_id}' not found.")
 
 
+def delete_raw_file(asset_id: str, extension: str = "parquet") -> None:
+    """Delete a raw asset by (asset_id, extension). No-op if absent.
+
+    Symmetric with `save_raw_*` — addresses by id, works in cloud + dev.
+    """
+    _delete(raw_uri(asset_id, extension))
+
+
 # =============================================================================
 # Raw Parquet (PyArrow tables)
 # =============================================================================
@@ -254,28 +275,10 @@ def list_raw_files(pattern: str) -> list[str]:
     Returns:
         Sorted list of relative paths.
     """
-    if is_cloud():
-        prefix = f"{get_r2_base_for_raw()}/"
-        # Convert glob to a prefix for the R2 listing, then filter with fnmatch
-        pattern_prefix = pattern.split("*")[0]
-        keys = list_keys(prefix + pattern_prefix)
-        import fnmatch
-        results = []
-        for key in keys:
-            rel = key[len(prefix):] if key.startswith(prefix) else key
-            if fnmatch.fnmatch(rel, pattern):
-                results.append(rel)
-        return sorted(results)
     raw_dir = Path(get_data_dir()) / "raw"
     if not raw_dir.exists():
         return []
     return sorted([str(p.relative_to(raw_dir)) for p in raw_dir.glob(pattern)])
-
-
-def get_r2_base_for_raw() -> str:
-    """Internal helper used by list_raw_files."""
-    from .config import get_r2_base
-    return f"{get_r2_base()}/raw"
 
 
 def raw_asset_exists(asset_id: str, ext: str = "parquet", max_age_days: int | None = None) -> bool:
@@ -289,14 +292,6 @@ def raw_asset_exists(asset_id: str, ext: str = "parquet", max_age_days: int | No
         max_age_days: If set, returns False if the asset is older than this many days.
     """
     uri = raw_uri(asset_id, ext)
-    if uri.startswith("s3://"):
-        meta = head_object(_s3_key_from_uri(uri))
-        if meta is None:
-            return False
-        if max_age_days is not None:
-            age = datetime.now(timezone.utc) - meta["LastModified"]
-            return age < timedelta(days=max_age_days)
-        return True
 
     def _check(p: Path) -> bool:
         if not p.exists():

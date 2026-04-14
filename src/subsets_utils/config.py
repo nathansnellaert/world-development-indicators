@@ -33,14 +33,24 @@ def get_run_id() -> str:
 # =============================================================================
 
 def get_data_dir() -> str:
-    """Get data directory for local (dev) mode. Raises in cloud mode.
+    """Root directory for this connector's raw + state files.
 
-    Dev writes go to `data/dev/` by default — a wegwerp scratch space,
-    separate from the read-only SSD mirror of R2 production data.
-    Override with DATA_DIR env var.
+    Defaults to `data/dev/` relative to cwd (override with DATA_DIR env
+    var). Symmetric in local and cloud — in cloud, cwd is the GitHub
+    Actions workspace, so this resolves to an ephemeral directory
+    inside the checkout.
+
+    Persistence: the subsets runner bookends each cloud invocation by
+    hydrating `<connector>/data/{raw,state}/*` from R2 before the
+    subprocess starts and flushing local changes back to R2 after it
+    exits (see meta/subsets_utils/runner.py). From a connector's
+    perspective, `get_data_dir()` is just "a directory with your
+    persistent raw + state files" in both modes — use filesystem
+    primitives freely (Path, glob, gzip.open, etc.).
+
+    Subset Delta tables live at `s3://` in cloud regardless — deltalake
+    manages its own storage layer (see `subsets_uri`).
     """
-    if is_cloud():
-        raise RuntimeError("get_data_dir() should not be called in cloud mode. Use R2 URIs instead.")
     return os.environ.get('DATA_DIR', 'data/dev')
 
 
@@ -147,9 +157,12 @@ def raw_key(asset_id: str, ext: str = "parquet") -> str:
 
 
 def raw_uri(asset_id: str, ext: str = "parquet") -> str:
-    """URI for a raw asset (s3:// in cloud, local path otherwise)."""
-    if is_cloud():
-        return f"s3://{get_bucket_name()}/{raw_key(asset_id, ext)}"
+    """Local filesystem path for a raw asset — cloud AND dev.
+
+    In cloud the runner flushes `<data_dir>/raw/*` to `<connector>/data/raw/*`
+    in R2 at end of invocation, so this local path is the persistent
+    address of the asset from the connector's point of view.
+    """
     return raw_path(asset_id, ext)
 
 
@@ -159,9 +172,11 @@ def state_key(asset: str) -> str:
 
 
 def state_uri(asset: str) -> str:
-    """URI for a state file (s3:// in cloud, local path otherwise)."""
-    if is_cloud():
-        return f"s3://{get_bucket_name()}/{state_key(asset)}"
+    """Local filesystem path for a state file — cloud AND dev.
+
+    Same bookend model as `raw_uri`: the runner flushes local state to
+    `<connector>/data/state/*` in R2 at end of invocation.
+    """
     return state_path(asset)
 
 
