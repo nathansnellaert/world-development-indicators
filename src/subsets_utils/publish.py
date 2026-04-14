@@ -37,5 +37,19 @@ def publish(dataset_name: str, metadata: dict):
     else:
         print(f"  Warning: no column_descriptions provided ({len(actual_columns)} columns undescribed)")
 
-    dt.alter.set_table_description(json.dumps(metadata))
+    # Delta's table description field has a hard 4000-char cap. Column
+    # descriptions are the usual culprit when they push us past it; drop them
+    # rather than crash the run, and surface the omission as a warning.
+    desc_json = json.dumps(metadata)
+    if len(desc_json) > 4000:
+        slim = {k: v for k, v in metadata.items() if k != "column_descriptions"}
+        desc_json = json.dumps(slim)
+        if len(desc_json) > 4000:
+            raise ValueError(
+                f"{dataset_name}: metadata JSON is {len(desc_json)} chars "
+                f"even after dropping column_descriptions; delta cap is 4000"
+            )
+        print(f"  Warning: column_descriptions omitted for {dataset_name} (metadata exceeded 4000 chars)")
+
+    dt.alter.set_table_description(desc_json)
     print(f"Published metadata for {dataset_name}")
