@@ -1,18 +1,27 @@
 """Data I/O for raw assets, state files, and Delta tables.
 
-Single code path for both local and cloud storage. The save/load functions
-build a URI via config.py's path-builders, then dispatch on uri prefix
-(s3:// → boto3 via r2.py, else → local file). The same code runs both modes.
+Single code path for both local and cloud storage. All raw + state I/O
+is routed through fsspec via `get_fs(uri)` — local paths use the local
+filesystem, `s3://` URIs use s3fs. The primitives below are a thin
+shell over fsspec; callers see a uniform byte-level API.
 
-Memory note: parquet reads/writes round-trip via in-memory bytes buffer. For
-oversized files (> RAM), use pyarrow.fs S3FileSystem with iter_batches() in
-your node directly — this module is the simple-case helper.
+Today `raw_uri()` / `state_uri()` still return local paths in cloud
+(the runner bookend hydrates/flushes from R2). When that bookend is
+removed, those URIs will return `s3://` and io.py will start streaming
+writes directly to R2 via s3fs multipart upload — no changes here
+required.
+
+Streaming: for datasets that don't fit in memory use `raw_writer()`
+(generic byte stream) or `raw_parquet_writer()` (row-group streaming
+ParquetWriter). Both are context managers that yield a file-like
+object or a writer, bounded by fsspec's block size.
 """
 
 import io
 import json
 import gzip
 import hashlib
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
@@ -24,10 +33,10 @@ from deltalake import DeltaTable
 from . import debug
 from .config import (
     is_cloud, get_data_dir, get_storage_options, get_bucket_name,
+    get_fs, get_fsspec_storage_options,
     raw_uri, state_uri, subsets_uri, raw_key, state_key,
     mirror_raw_path, mirror_state_path,
 )
-from .r2 import upload_bytes, download_bytes, head_object, list_keys
 
 
 # =============================================================================
@@ -50,52 +59,36 @@ def _read_with_mirror_fallback(uri: str, mirror: Path | None) -> Optional[bytes]
 
 
 # =============================================================================
-# URI dispatch — the only place that branches on s3:// vs local
+# URI dispatch via fsspec
 # =============================================================================
 
-def _s3_key_from_uri(uri: str) -> str:
-    """Extract the key portion from an s3://bucket/key URI."""
-    _, _, rest = uri.partition("s3://")
-    _, _, key = rest.partition("/")
-    return key
-
-
 def _write_bytes(uri: str, data: bytes) -> None:
-    """Write bytes to a URI (s3:// or local path)."""
-    if uri.startswith("s3://"):
-        upload_bytes(data, _s3_key_from_uri(uri))
-    else:
-        p = Path(uri)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_bytes(data)
+    """Write bytes to a URI (s3:// or local path) via fsspec."""
+    fs = get_fs(uri)
+    with fs.open(uri, "wb") as f:
+        f.write(data)
 
 
 def _read_bytes(uri: str) -> Optional[bytes]:
-    """Read bytes from a URI. Returns None if not found."""
-    if uri.startswith("s3://"):
-        return download_bytes(_s3_key_from_uri(uri))
-    p = Path(uri)
-    return p.read_bytes() if p.exists() else None
+    """Read bytes from a URI via fsspec. Returns None if not found."""
+    fs = get_fs(uri)
+    try:
+        with fs.open(uri, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
 
 
 def _exists(uri: str) -> bool:
-    """Check if a URI exists, lightweight (head_object for s3, stat for local)."""
-    if uri.startswith("s3://"):
-        return head_object(_s3_key_from_uri(uri)) is not None
-    return Path(uri).exists()
+    """Check if a URI exists."""
+    return get_fs(uri).exists(uri)
 
 
 def _delete(uri: str) -> None:
-    """Delete a URI (s3:// or local path). No-op if already absent."""
-    if uri.startswith("s3://"):
-        from .r2 import get_s3_client
-        import os
-        client = get_s3_client()
-        client.delete_object(Bucket=os.environ["R2_BUCKET_NAME"], Key=_s3_key_from_uri(uri))
-    else:
-        p = Path(uri)
-        if p.exists():
-            p.unlink()
+    """Delete a URI. No-op if already absent."""
+    fs = get_fs(uri)
+    if fs.exists(uri):
+        fs.rm(uri)
 
 
 # =============================================================================
@@ -172,14 +165,26 @@ def save_raw_file(content: str | bytes, asset_id: str, extension: str = "txt") -
     return uri
 
 
-def load_raw_file(asset_id: str, extension: str = "txt") -> str | bytes:
-    """Load a raw file. Returns str if utf-8 decodable, else bytes."""
+def load_raw_file(asset_id: str, extension: str = "txt", *, binary: bool = False) -> str | bytes:
+    """Load a raw file.
+
+    Args:
+        asset_id: Asset name.
+        extension: File extension.
+        binary: If True, always return bytes. If False (default), attempt
+            UTF-8 decode and return str on success, bytes on failure.
+            Set binary=True for xlsx/zip/parquet or any file where you
+            need deterministic bytes — the decode fallback is unreliable
+            when a binary payload happens to be ASCII-only.
+    """
     from .tracking import record_read
     uri = raw_uri(asset_id, extension)
     data = _read_with_mirror_fallback(uri, mirror_raw_path(asset_id, extension))
     if data is None:
         raise FileNotFoundError(f"Raw asset '{asset_id}.{extension}' not found at {uri}")
     record_read(f"raw/{asset_id}.{extension}")
+    if binary:
+        return data
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
@@ -263,6 +268,116 @@ def load_raw_parquet(asset_id: str) -> pa.Table:
 
 
 # =============================================================================
+# Streaming helpers — for datasets too big to fit in memory
+#
+# These open an fsspec file handle via `get_fs(uri)`. Local paths get auto
+# parent-dir creation; s3:// URIs stream via multipart upload.
+# =============================================================================
+
+@contextmanager
+def raw_writer(
+    asset_id: str,
+    extension: str = "txt",
+    *,
+    mode: str = "wb",
+    compression: str | None = None,
+    encoding: str | None = "utf-8",
+):
+    """Streaming writer for a raw asset. Context manager yielding a file handle.
+
+    Use when the content doesn't fit in memory. Writes go through fsspec,
+    so s3:// URIs stream via multipart upload and local paths get parent
+    dirs auto-created. Supports native gzip/bz2/xz compression.
+
+    Args:
+        asset_id: Logical asset name (same as save_raw_*).
+        extension: File extension (e.g. "ndjson.gz", "csv").
+        mode: File mode — "wb" for bytes (default), "wt" for text.
+        compression: "gzip", "bz2", "xz", or None. Matches fsspec.
+        encoding: Text encoding when mode="wt". Ignored for binary.
+
+    Example:
+        with raw_writer("big_dump", "ndjson.gz", mode="wt", compression="gzip") as f:
+            for row in stream:
+                f.write(json.dumps(row) + "\\n")
+    """
+    from .tracking import record_write
+    uri = raw_uri(asset_id, extension)
+    fs = get_fs(uri)
+    open_kwargs = {}
+    if "t" in mode:
+        open_kwargs["encoding"] = encoding
+    if compression is not None:
+        open_kwargs["compression"] = compression
+    with fs.open(uri, mode=mode, **open_kwargs) as f:
+        yield f
+    print(f"  -> Saved {asset_id}.{extension}")
+    record_write(f"raw/{asset_id}.{extension}")
+
+
+@contextmanager
+def raw_reader(
+    asset_id: str,
+    extension: str = "txt",
+    *,
+    mode: str = "rb",
+    compression: str | None = None,
+    encoding: str | None = "utf-8",
+):
+    """Streaming reader for a raw asset. Symmetric with raw_writer().
+
+    Honors the SSD mirror fallback in dev mode: if the asset is missing
+    from the local dev dir but present in the mirror, it reads from the
+    mirror path transparently.
+    """
+    from .tracking import record_read
+    uri = raw_uri(asset_id, extension)
+
+    # Dev mode mirror fallback
+    target = uri
+    if not uri.startswith("s3://") and not Path(uri).exists():
+        mirror = mirror_raw_path(asset_id, extension)
+        if mirror is not None and mirror.exists():
+            target = str(mirror)
+
+    fs = get_fs(target)
+    open_kwargs = {}
+    if "t" in mode:
+        open_kwargs["encoding"] = encoding
+    if compression is not None:
+        open_kwargs["compression"] = compression
+    with fs.open(target, mode=mode, **open_kwargs) as f:
+        yield f
+    record_read(f"raw/{asset_id}.{extension}")
+
+
+@contextmanager
+def raw_parquet_writer(asset_id: str, schema: pa.Schema, *, compression: str = "snappy"):
+    """Streaming Parquet writer yielding a `pq.ParquetWriter`.
+
+    Bounded memory for arbitrarily large datasets — call `write_table()`
+    or `write_batch()` inside the `with` block, and the writer flushes
+    row groups as they grow. Works for both local and s3:// URIs.
+
+    Example:
+        with raw_parquet_writer("wiki_dump", schema) as w:
+            for batch in stream_wikipedia():
+                w.write_batch(batch)
+    """
+    from .tracking import record_write
+    uri = raw_uri(asset_id, "parquet")
+    fs = get_fs(uri)
+    with fs.open(uri, "wb") as f:
+        writer = pq.ParquetWriter(f, schema, compression=compression)
+        try:
+            yield writer
+        finally:
+            writer.close()
+    print(f"  -> Saved {asset_id}.parquet (streamed)")
+    record_write(f"raw/{asset_id}.parquet")
+
+
+# =============================================================================
 # Listing & existence checks
 # =============================================================================
 
@@ -275,7 +390,27 @@ def list_raw_files(pattern: str) -> list[str]:
     Returns:
         Sorted list of relative paths.
     """
-    raw_dir = Path(get_data_dir()) / "raw"
+    # Probe raw_uri to get the connector's raw dir (s3:// or local). The
+    # "__probe__" asset is never created — raw_uri only builds the path.
+    probe = raw_uri("__probe__", "__")
+    base_uri = probe.rsplit("/", 1)[0]
+
+    if base_uri.startswith("s3://"):
+        fs = get_fs(base_uri)
+        try:
+            matches = fs.glob(f"{base_uri}/{pattern}")
+        except FileNotFoundError:
+            return []
+        # s3fs returns keys without "s3://bucket/" prefix
+        from urllib.parse import urlparse
+        s3_prefix = urlparse(base_uri).path.lstrip("/") + "/"
+        bucket = urlparse(base_uri).netloc
+        return sorted([
+            m[len(f"{bucket}/{s3_prefix}"):] if m.startswith(f"{bucket}/{s3_prefix}") else m[len(s3_prefix):]
+            for m in matches
+        ])
+
+    raw_dir = Path(base_uri)
     if not raw_dir.exists():
         return []
     return sorted([str(p.relative_to(raw_dir)) for p in raw_dir.glob(pattern)])

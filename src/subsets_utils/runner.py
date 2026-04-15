@@ -150,85 +150,6 @@ def _hydrate_resume_state(connector: str, run_id: str, log_dir: Path) -> bool:
     return True
 
 
-def _hydrate_data_dir(connector: str, data_dir: Path) -> None:
-    """Download prior raw + state files from R2 into the local data dir.
-
-    Called before the subprocess in cloud mode so connectors see the
-    persistent state of `<connector>/data/{raw,state}/*`. Size-skip for
-    cheap incremental hydration: if a file already exists locally with
-    the same byte count, we assume it is current and skip the GET.
-    """
-    if not is_cloud():
-        return
-
-    client = get_s3_client()
-    bucket = os.environ["R2_BUCKET_NAME"]
-    paginator = client.get_paginator("list_objects_v2")
-
-    for subdir in ("raw", "state"):
-        prefix = f"{connector}/data/{subdir}/"
-        local_subdir = data_dir / subdir
-        local_subdir.mkdir(parents=True, exist_ok=True)
-
-        downloaded = 0
-        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-            for obj in page.get("Contents", []) or []:
-                key = obj["Key"]
-                rel = key[len(prefix):]
-                if not rel:
-                    continue
-                local = local_subdir / rel
-                if local.exists() and local.stat().st_size == obj["Size"]:
-                    continue
-                local.parent.mkdir(parents=True, exist_ok=True)
-                client.download_file(bucket, key, str(local))
-                downloaded += 1
-
-        if downloaded:
-            print(f"[runner] Hydrated {downloaded} file(s) from {prefix}")
-
-
-def _flush_data_dir(connector: str, data_dir: Path) -> None:
-    """Upload raw + state from the local data dir to R2.
-
-    Called after the subprocess exits in cloud mode. Skip-if-size-matches
-    avoids redundant PUTs for files the subprocess didn't touch. Always
-    run — even on failure — so partial progress is persisted for resume.
-    """
-    if not is_cloud():
-        return
-
-    client = get_s3_client()
-    bucket = os.environ["R2_BUCKET_NAME"]
-
-    for subdir in ("raw", "state"):
-        local_subdir = data_dir / subdir
-        if not local_subdir.exists():
-            continue
-
-        uploaded = 0
-        for local_file in local_subdir.rglob("*"):
-            if not local_file.is_file():
-                continue
-            rel = local_file.relative_to(local_subdir)
-            key = f"{connector}/data/{subdir}/{rel}"
-
-            local_size = local_file.stat().st_size
-            try:
-                remote = client.head_object(Bucket=bucket, Key=key)
-                if remote["ContentLength"] == local_size:
-                    continue
-            except client.exceptions.ClientError as e:
-                if e.response["Error"]["Code"] not in ("404", "NoSuchKey"):
-                    raise
-
-            client.upload_file(str(local_file), bucket, key)
-            uploaded += 1
-
-        if uploaded:
-            print(f"[runner] Flushed {uploaded} file(s) to {connector}/data/{subdir}/")
-
-
 def _read_run_status(log_dir: Path) -> str | None:
     """Read run.json status, or None if missing/invalid."""
     p = log_dir / "run.json"
@@ -424,12 +345,11 @@ def main():
     if is_resume:
         hydrated = _hydrate_resume_state(connector, run_id, log_dir)
 
-    # Data dir hydration: mirror R2 raw + state into the local data dir so
-    # the connector sees a persistent filesystem. Runs on every cloud
-    # invocation (resume or fresh) — first run finds nothing and is a no-op.
+    # Dev data dir still needs to exist for local scratch writes.
+    # In cloud, raw/state go straight to R2 via fsspec — no hydrate needed.
     data_dir = Path(get_data_dir())
-    data_dir.mkdir(parents=True, exist_ok=True)
-    _hydrate_data_dir(connector, data_dir)
+    if not is_cloud():
+        data_dir.mkdir(parents=True, exist_ok=True)
 
     # Record invocation start
     invocation_id = "i-" + datetime.now(ZoneInfo("UTC")).strftime("%Y%m%d-%H%M%S")
@@ -532,15 +452,9 @@ def main():
         write_error_log(log_dir, subprocess_exit, output_file)
         debug.log_run_end(status="failed", error=error_msg)
 
-    # Cloud: flush the connector's data dir (raw + state) back to R2 so
-    # it is visible to the next invocation. Runs even on failure so partial
-    # progress is preserved for retry / continuation.
+    # Cloud: raw + state already live in R2 (connectors write direct via
+    # fsspec/s3fs). Only logs need to be evacuated.
     if is_cloud():
-        try:
-            _flush_data_dir(connector, data_dir)
-        except Exception as e:
-            print(f"[runner] Data dir flush failed: {e}")
-
         # Evacuate invocation logs to R2 under <connector>/runs/<run_id>/
         prefix = _connector_runs_prefix(connector, run_id)
         print(f"Uploading logs to R2 under {prefix}/...")

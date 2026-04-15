@@ -139,6 +139,46 @@ def get_bucket_name() -> str:
 
 
 # =============================================================================
+# fsspec backend — unified I/O over local file: and R2 s3://
+#
+# All raw + state I/O in io.py dispatches through get_fs(uri). For local
+# paths this returns the local filesystem; for s3:// URIs it returns an
+# s3fs filesystem pointed at R2. Connectors never see the difference —
+# they call save_raw_*/load_raw_*/raw_writer, which route through here.
+#
+# Today raw_uri() / state_uri() still return local paths in cloud (the
+# runner bookend hydrates/flushes from R2). When the bookend is removed,
+# those URIs will flip to s3:// and the same io.py code will stream
+# writes directly to R2 via s3fs multipart upload — no code changes in
+# io.py required.
+# =============================================================================
+
+def get_fsspec_storage_options(uri: str) -> dict:
+    """fsspec storage_options for a URI. Empty for local, R2 creds for s3://."""
+    if not uri.startswith("s3://"):
+        return {}
+    return {
+        "endpoint_url": f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+        "key": os.environ["R2_ACCESS_KEY_ID"],
+        "secret": os.environ["R2_SECRET_ACCESS_KEY"],
+        "client_kwargs": {"region_name": "auto"},
+    }
+
+
+def get_fs(uri: str = ""):
+    """fsspec filesystem for a URI. Protocol-dispatched, cached by fsspec.
+
+    For s3:// URIs returns s3fs pointed at R2 (requires `s3fs` installed).
+    For everything else returns the local filesystem with auto_mkdir so
+    parent dirs are created transparently on open.
+    """
+    import fsspec
+    if uri.startswith("s3://"):
+        return fsspec.filesystem("s3", **get_fsspec_storage_options("s3://"))
+    return fsspec.filesystem("file", auto_mkdir=True)
+
+
+# =============================================================================
 # Path / URI Builders
 #
 # All save/load functions in io.py call these to get a uri (s3:// in cloud,
@@ -157,12 +197,14 @@ def raw_key(asset_id: str, ext: str = "parquet") -> str:
 
 
 def raw_uri(asset_id: str, ext: str = "parquet") -> str:
-    """Local filesystem path for a raw asset — cloud AND dev.
+    """URI for a raw asset. s3:// in cloud, local path in dev.
 
-    In cloud the runner flushes `<data_dir>/raw/*` to `<connector>/data/raw/*`
-    in R2 at end of invocation, so this local path is the persistent
-    address of the asset from the connector's point of view.
+    In cloud, io.py streams writes directly to R2 via s3fs multipart
+    uploads — no disk staging on the runner. In dev, connectors see a
+    plain filesystem path under `data/dev/raw/`.
     """
+    if is_cloud():
+        return f"s3://{get_bucket_name()}/{get_r2_base()}/raw/{asset_id}.{ext}"
     return raw_path(asset_id, ext)
 
 
@@ -172,11 +214,15 @@ def state_key(asset: str) -> str:
 
 
 def state_uri(asset: str) -> str:
-    """Local filesystem path for a state file — cloud AND dev.
+    """URI for a state file. s3:// in cloud, local path in dev.
 
-    Same bookend model as `raw_uri`: the runner flushes local state to
-    `<connector>/data/state/*` in R2 at end of invocation.
+    State writes are direct PUTs in cloud — each `save_state()` call
+    results in one R2 PUT operation. Typical checkpointing connectors
+    make hundreds of these per run; cost is negligible (~$5/month delta
+    across the whole fleet — see cost analysis).
     """
+    if is_cloud():
+        return f"s3://{get_bucket_name()}/{get_r2_base()}/state/{asset}.json"
     return state_path(asset)
 
 
