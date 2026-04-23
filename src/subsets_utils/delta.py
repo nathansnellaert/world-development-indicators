@@ -10,11 +10,27 @@ from pathlib import Path
 from typing import Union
 import pyarrow as pa
 from deltalake import write_deltalake, DeltaTable, CommitProperties
+try:
+    from deltalake.exceptions import TableNotFoundError
+except ImportError:
+    try:
+        from deltalake import TableNotFoundError  # older deltalake
+    except ImportError:
+        TableNotFoundError = None  # fallback: we'll handle by exception type name
 
 from .config import get_data_dir, is_cloud, get_storage_options, subsets_uri
 from . import debug
 from .io import data_hash
 from .tracking import record_write
+
+
+def _is_table_not_found(exc: Exception) -> bool:
+    """Distinguish 'table does not exist yet' from other Delta errors."""
+    if TableNotFoundError is not None and isinstance(exc, TableNotFoundError):
+        return True
+    # Fallback string match for deltalake versions without a typed exception
+    msg = str(exc).lower()
+    return "not a delta table" in msg or "no such file" in msg or "does not exist" in msg
 
 
 def _run_commit_properties() -> CommitProperties | None:
@@ -166,6 +182,21 @@ def _get_opts() -> dict | None:
     return get_storage_options() if is_cloud() else None
 
 
+def _target_row_count(dt: DeltaTable) -> int:
+    """Sum num_records from the Delta log's add actions.
+
+    Reads only file-level metadata (parquet footer stats already in the log),
+    no data scan. Returns -1 if unavailable so callers can still report.
+    """
+    try:
+        # deltalake ≥1.0 returns an arro3 RecordBatch; bridge to pyarrow.
+        batch = pa.record_batch(dt.get_add_actions(flatten=True))
+        col = batch.column("num_records")
+        return int(sum(v for v in col.to_pylist() if v is not None))
+    except Exception:
+        return -1
+
+
 def _log_write(name: str, table: pa.Table, mode: str):
     """Log the write operation."""
     size_mb = round(table.nbytes / 1024 / 1024, 2)
@@ -183,6 +214,41 @@ def _log_write(name: str, table: pa.Table, mode: str):
         null_counts=null_counts,
         mode=mode
     )
+
+
+def _log_write_meta(name: str, schema: pa.Schema, row_count: int, mode: str):
+    """Schema-only write log for streamed sources — no nbytes or null counts."""
+    cols = ', '.join(f.name for f in schema)
+    rows_str = f"{row_count:,}" if row_count >= 0 else "?"
+    print(f"[{mode}] {name}: {rows_str} rows, {len(schema)} cols ({cols})")
+    debug.log_data_output(
+        dataset_name=name,
+        row_count=row_count if row_count >= 0 else 0,
+        size_bytes=0,
+        columns=[f.name for f in schema],
+        column_count=len(schema),
+        null_counts={},
+        mode=mode,
+    )
+
+
+def _source_hash(source, schema: pa.Schema, target_row_count: int) -> str:
+    """Hash a merge source.
+
+    For a Table: hash source rowcount + schema (stable across runs when the
+    source is unchanged).
+    For a RecordBatchReader: the stream has been consumed by deltalake by now,
+    so we fall back to target rowcount + schema. This isn't a source-only
+    fingerprint but it's still a stable descriptor of the written state.
+    """
+    import hashlib
+    h = hashlib.md5()
+    if isinstance(source, pa.Table):
+        h.update(f"{len(source)}".encode())
+    else:
+        h.update(f"{target_row_count}".encode())
+    h.update(str(schema).encode())
+    return h.hexdigest()[:16]
 
 
 def _validate_keys(table: pa.Table, keys: list[str], name: str):
@@ -234,13 +300,13 @@ def _validate_keys(table: pa.Table, keys: list[str], name: str):
 
 
 def merge(
-    table: pa.Table,
+    source: Union[pa.Table, pa.RecordBatchReader],
     name: str,
     *,
     key: Union[str, list[str]],
     partition_by: list[str] = None,
     validate: bool = True
-) -> str:
+) -> "WriteResult":
     """Upsert data into a Delta table.
 
     - Inserts new records (key doesn't exist)
@@ -248,41 +314,78 @@ def merge(
     - Duplicates impossible
 
     Args:
-        table: PyArrow table to write
+        source: PyArrow Table or RecordBatchReader. Readers stream batches
+            through deltalake without materializing the full dataset in
+            memory — use this for large sources via DuckDB's
+            fetch_record_batch() or similar. validate=True is incompatible
+            with readers (would consume the stream).
         name: Dataset name
         key: Column(s) that uniquely identify a record
         partition_by: Optional columns to partition by
-        validate: Check key uniqueness before merge (default True)
+        validate: Check key uniqueness before merge (default True).
+            Must be False for RecordBatchReader sources.
 
     Returns:
-        Delta table URI
+        WriteResult with uri, version, hash, rows.
     """
-    if len(table) == 0:
+    is_reader = isinstance(source, pa.RecordBatchReader)
+    if is_reader and validate:
+        raise ValueError(
+            "merge(): validate=True cannot be combined with a RecordBatchReader "
+            "source — the stream would be consumed by validation. Pass "
+            "validate=False or materialize to a pa.Table first."
+        )
+
+    if not is_reader and len(source) == 0:
         print(f"[merge] {name}: no data to write")
         return None
 
     # Normalize key to list
     keys = [key] if isinstance(key, str) else key
 
-    # Validate keys
+    # Validate keys (table-only)
     if validate:
-        _validate_keys(table, keys, name)
+        _validate_keys(source, keys, name)
+
+    schema = source.schema
+    column_names = [f.name for f in schema]
 
     uri = _get_uri(name)
     opts = _get_opts()
 
+    # Probe for table existence. If it doesn't exist yet, create it via
+    # write_deltalake. Any OTHER exception must propagate — we must NOT
+    # silently fall back to overwrite mode because that would destroy an
+    # existing table's contents on a transient merge failure.
     try:
-        # Try to merge into existing table
         dt = DeltaTable(uri, storage_options=opts)
+        table_exists = True
+    except Exception as e:
+        if not _is_table_not_found(e):
+            raise
+        table_exists = False
 
+    if not table_exists:
+        write_deltalake(
+            uri,
+            source,
+            mode="overwrite",
+            partition_by=partition_by,
+            storage_options=opts,
+            commit_properties=_run_commit_properties(),
+        )
+        dt = DeltaTable(uri, storage_options=opts)
+        new_count = _target_row_count(dt)
+        version = dt.version()
+        h = _source_hash(source, schema, new_count)
+        _log_write_meta(name, schema, new_count, "merge (created)")
+    else:
         # Build merge predicate
         predicate = " AND ".join([f"target.{k} = source.{k}" for k in keys])
-
-        # All columns for update/insert
-        updates = {col: f"source.{col}" for col in table.column_names}
+        updates = {col: f"source.{col}" for col in column_names}
 
         dt.merge(
-            source=table,
+            source=source,
             predicate=predicate,
             source_alias="source",
             target_alias="target",
@@ -293,65 +396,53 @@ def merge(
             updates=updates
         ).execute()
 
-        result_table = dt.to_pyarrow_table()
-        new_count = len(result_table)
+        # Rowcount from Delta log (parquet footers), not by materializing target.
+        # Hash on source rowcount+schema — stable fingerprint for unchanged inputs.
+        new_count = _target_row_count(dt)
         version = dt.version()
-        h = data_hash(result_table)
-        _log_write(name, table, f"merge → {new_count:,} total")
-
-    except Exception:
-        # Table doesn't exist, create it
-        write_deltalake(
-            uri,
-            table,
-            mode="overwrite",
-            partition_by=partition_by,
-            storage_options=opts,
-            commit_properties=_run_commit_properties(),
-        )
-        dt = DeltaTable(uri, storage_options=opts)
-        new_count = len(table)
-        version = dt.version()
-        h = data_hash(table)
-        _log_write(name, table, "merge (created)")
+        h = _source_hash(source, schema, new_count)
+        _log_write_meta(name, schema, new_count, f"merge → {new_count:,} total")
 
     record_write(f"subsets/{name}", version=version, hash=h)
     return WriteResult(uri=uri, version=version, hash=h, rows=new_count)
 
 
 def overwrite(
-    table: pa.Table,
+    source: Union[pa.Table, pa.RecordBatchReader],
     name: str,
     *,
     partition_by: list[str] = None
-) -> str:
+) -> "WriteResult":
     """Replace entire Delta table with new data.
 
-    Use ONLY for:
+    Use for:
     - Snapshots without natural key (current prices, live status)
     - Computed aggregates
-    - Data that's fully recomputed each run
+    - Data that's fully recomputed each run (e.g. SDMX full-refresh flows
+      where the connector pulls the complete dataset on every invocation)
 
-    For anything with a natural key, use merge() instead.
+    merge() is preferable only when runs bring PARTIAL data and you want
+    target rows not in source to survive — otherwise overwrite is both
+    simpler and cheaper (no target-side join).
 
-    Args:
-        table: PyArrow table to write
-        name: Dataset name
-        partition_by: Optional columns to partition by
-
-    Returns:
-        Delta table URI
+    Accepts a pa.Table or pa.RecordBatchReader. Readers stream through
+    deltalake without materializing the full source in memory — use via
+    DuckDB's fetch_record_batch() or similar.
     """
-    if len(table) == 0:
+    is_reader = isinstance(source, pa.RecordBatchReader)
+
+    if not is_reader and len(source) == 0:
         print(f"[overwrite] {name}: no data to write")
         return None
+
+    schema = source.schema
 
     uri = _get_uri(name)
     opts = _get_opts()
 
     write_deltalake(
         uri,
-        table,
+        source,
         mode="overwrite",
         partition_by=partition_by,
         storage_options=opts,
@@ -361,48 +452,51 @@ def overwrite(
 
     dt = DeltaTable(uri, storage_options=opts)
     version = dt.version()
-    h = data_hash(table)
+    new_count = _target_row_count(dt)
+    h = _source_hash(source, schema, new_count)
 
-    _log_write(name, table, "overwrite")
+    _log_write_meta(name, schema, new_count, "overwrite")
     record_write(f"subsets/{name}", version=version, hash=h)
-    return WriteResult(uri=uri, version=version, hash=h, rows=len(table))
+    return WriteResult(uri=uri, version=version, hash=h, rows=new_count)
 
 
 def append(
-    table: pa.Table,
+    source: Union[pa.Table, pa.RecordBatchReader],
     name: str,
     *,
     partition_by: list[str] = None
-) -> str:
+) -> "WriteResult":
     """Append data to a Delta table.
 
     WARNING: No deduplication! Use ONLY for:
     - Immutable events (audit logs, raw API responses)
     - Data where duplicates are impossible by design
+    - Chunked loads into an already-partitioned table where each chunk's
+      partition keys are disjoint from previously-written chunks
 
     Always use partition_by for cleanup capability.
 
-    Args:
-        table: PyArrow table to write
-        name: Dataset name
-        partition_by: Columns to partition by (strongly recommended)
-
-    Returns:
-        Delta table URI
+    Accepts pa.Table or pa.RecordBatchReader. Readers stream through
+    deltalake without materializing in memory — use for chunked loads
+    (e.g. per-partition dedup) driven by DuckDB's fetch_record_batch().
     """
-    if len(table) == 0:
+    is_reader = isinstance(source, pa.RecordBatchReader)
+
+    if not is_reader and len(source) == 0:
         print(f"[append] {name}: no data to write")
         return None
 
     if partition_by is None:
         print(f"⚠️  Warning: append() without partition_by makes cleanup difficult")
 
+    schema = source.schema
+
     uri = _get_uri(name)
     opts = _get_opts()
 
     write_deltalake(
         uri,
-        table,
+        source,
         mode="append",
         partition_by=partition_by,
         storage_options=opts,
@@ -412,8 +506,9 @@ def append(
 
     dt = DeltaTable(uri, storage_options=opts)
     version = dt.version()
-    h = data_hash(table)
+    new_count = _target_row_count(dt)
+    h = _source_hash(source, schema, new_count)
 
-    _log_write(name, table, "append")
+    _log_write_meta(name, schema, new_count, "append")
     record_write(f"subsets/{name}", version=version, hash=h)
-    return WriteResult(uri=uri, version=version, hash=h, rows=len(table))
+    return WriteResult(uri=uri, version=version, hash=h, rows=new_count)

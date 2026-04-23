@@ -3,8 +3,8 @@ from .io import (
     load_state, save_state, load_asset,
     save_raw_json, load_raw_json,
     save_raw_file, load_raw_file,
-    save_raw_parquet, load_raw_parquet,
-    list_raw_files, delete_raw_file, data_hash, raw_asset_exists,
+    save_raw_parquet, load_raw_parquet, raw_parquet_localpath,
+    list_raw_files, delete_raw_file, data_hash, raw_parquet_hash, raw_asset_exists,
     raw_writer, raw_reader, raw_parquet_writer,
 )
 from .delta import merge, overwrite, append, validate_asset, WriteResult
@@ -24,9 +24,10 @@ __all__ = [
     # Publishing
     'publish',
     # State & raw I/O
-    'load_state', 'save_state', 'load_asset', 'data_hash',
+    'load_state', 'save_state', 'load_asset', 'data_hash', 'raw_parquet_hash',
     'save_raw_json', 'load_raw_json', 'save_raw_file', 'load_raw_file',
-    'save_raw_parquet', 'load_raw_parquet', 'list_raw_files', 'delete_raw_file',
+    'save_raw_parquet', 'load_raw_parquet', 'raw_parquet_localpath',
+    'list_raw_files', 'delete_raw_file',
     'raw_asset_exists',
     # Streaming I/O
     'raw_writer', 'raw_reader', 'raw_parquet_writer',

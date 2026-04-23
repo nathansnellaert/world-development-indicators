@@ -4,75 +4,23 @@
 - Splits data by indicator → table mapping
 - Transforms to wide format (indicators become columns)
 - Uploads each domain table with metadata
+- Skips unchanged tables via data_hash + state
 """
-import csv
-import json
-from pathlib import Path
-from collections import defaultdict
 import duckdb
 import pyarrow as pa
 import pyarrow.compute as pc
-from subsets_utils import load_state, save_state, merge, publish, validate
+from subsets_utils import load_state, save_state, merge, publish, data_hash
 from subsets_utils.duckdb import raw
 from nodes import ingest
-
-MAPPINGS_DIR = Path(__file__).parent.parent.parent / 'mappings'
-
-COMMON_COLUMN_DESCRIPTIONS = {
-    "country_name": "Country name from World Bank database",
-    "country_code2": "ISO 3166-1 alpha-2 country code",
-    "year": "Observation year",
-}
-
-
-def load_indicator_mapping() -> dict:
-    """Load the indicator to table mapping from CSV file."""
-    mapping_path = MAPPINGS_DIR / 'indicator_table_mapping.csv'
-    indicator_to_table = {}
-    with open(mapping_path, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            indicator_to_table[row['indicator_name']] = row['table_name']
-    return indicator_to_table
-
-
-def load_indicator_to_column_mapping() -> dict:
-    """Load the indicator name to column name mapping from CSV file."""
-    mapping_path = MAPPINGS_DIR / 'indicator_to_col_name.csv'
-    indicator_to_column = {}
-    with open(mapping_path, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            indicator_to_column[row['indicator_name']] = row['column_name']
-    return indicator_to_column
-
-
-def load_table_metadata() -> dict:
-    """Load table metadata from JSON file."""
-    metadata_path = MAPPINGS_DIR / 'table_metadata.json'
-    with open(metadata_path, 'r') as f:
-        return json.load(f)
-
-
-def load_indicator_summaries() -> dict:
-    """Load indicator summaries and convert to {indicator_code: description} format."""
-    summaries_path = MAPPINGS_DIR / 'indicator_summaries.json'
-    with open(summaries_path, 'r') as f:
-        summaries_list = json.load(f)
-    return {item['indicator_code']: item['description'] for item in summaries_list}
-
-
-def test(table: pa.Table, table_name: str) -> None:
-    """Validate transformed table before upload."""
-    validate(table, {
-        "columns": {
-            "country_name": "string",
-            "country_code2": "string",
-            "year": "int",
-        },
-        "not_null": ["country_name", "country_code2", "year"],
-        "min_rows": 1,
-    })
+from connector_utils import (
+    LICENSE,
+    COMMON_COLUMN_DESCRIPTIONS,
+    load_indicator_mapping,
+    load_indicator_to_column_mapping,
+    load_table_metadata,
+    load_indicator_summaries,
+    validate_wdi_table,
+)
 
 
 def run():
@@ -249,7 +197,14 @@ def run():
                     column_descriptions[col_name] = indicator_summaries[code]
 
         # Validate before upload
-        test(wide_table, table_name)
+        validate_wdi_table(wide_table, table_name)
+
+        # Skip unchanged tables
+        h = data_hash(wide_table)
+        if load_state(table_name).get("hash") == h:
+            print(f"      Skipping {table_name} - unchanged")
+            transformed_tables.append(table_name)
+            continue
 
         # Upload data
         merge(wide_table, table_name, key=["country_name", "country_code2", "year"])
@@ -260,9 +215,11 @@ def run():
             "id": table_name,
             "title": f"WDI {meta.get('title', table_name)}",
             "description": meta.get("description", f"World Development Indicators data for {table_name}."),
+            "license": LICENSE,
             "column_descriptions": column_descriptions,
         }
         publish(table_name, metadata)
+        save_state(table_name, {"hash": h})
 
         transformed_tables.append(table_name)
 
@@ -286,22 +243,29 @@ def run():
             unmapped_table = unmapped_table.filter(valid_mask)
 
             if len(unmapped_table) > 0:
-                merge(unmapped_table, "wdi_unmapped", key=["country_name", "country_code2", "indicator_name", "indicator_code", "year"])
-                publish("wdi_unmapped", {
-                    "id": "wdi_unmapped",
-                    "title": "WDI Unmapped Indicators",
-                    "description": "World Development Indicators that have not yet been mapped to a domain-specific table.",
-                    "column_descriptions": {
-                        "country_name": "Country name from World Bank database",
-                        "country_code2": "ISO 3166-1 alpha-2 country code",
-                        "indicator_name": "World Bank indicator name",
-                        "indicator_code": "World Bank indicator code",
-                        "year": "Observation year",
-                        "value": "Numeric indicator value",
-                    },
-                })
-                print(f"    Saved {len(unmapped_table):,} unmapped records")
-                transformed_tables.append("wdi_unmapped")
+                h = data_hash(unmapped_table)
+                if load_state("wdi_unmapped").get("hash") == h:
+                    print(f"    Skipping wdi_unmapped - unchanged")
+                    transformed_tables.append("wdi_unmapped")
+                else:
+                    merge(unmapped_table, "wdi_unmapped", key=["country_name", "country_code2", "indicator_name", "indicator_code", "year"])
+                    publish("wdi_unmapped", {
+                        "id": "wdi_unmapped",
+                        "title": "WDI Unmapped Indicators",
+                        "description": "World Development Indicators that have not yet been mapped to a domain-specific table.",
+                        "license": LICENSE,
+                        "column_descriptions": {
+                            "country_name": "Country name from World Bank database",
+                            "country_code2": "ISO 3166-1 alpha-2 country code",
+                            "indicator_name": "World Bank indicator name",
+                            "indicator_code": "World Bank indicator code",
+                            "year": "Observation year",
+                            "value": "Numeric indicator value",
+                        },
+                    })
+                    save_state("wdi_unmapped", {"hash": h})
+                    print(f"    Saved {len(unmapped_table):,} unmapped records")
+                    transformed_tables.append("wdi_unmapped")
 
     save_state("wdi_tables", {"transformed_tables": sorted(transformed_tables)})
     print(f"\n  Complete! Transformed {len(transformed_tables)} tables")

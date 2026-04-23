@@ -103,6 +103,35 @@ def data_hash(table: pa.Table) -> str:
     return h.hexdigest()[:16]
 
 
+def raw_parquet_hash(asset_id: str) -> str | None:
+    """Hash a raw parquet by footer metadata only — no data scan.
+
+    Reads the parquet footer (rowcount + Arrow schema) via fsspec and returns
+    a hash equivalent to data_hash(load_raw_parquet(asset_id)) without loading
+    the data. Returns None if the file doesn't exist.
+
+    Use in transform nodes to short-circuit before loading GBs into memory
+    when the raw file hasn't changed since last run.
+    """
+    uri = raw_uri(asset_id, "parquet")
+    fs = get_fs(uri)
+
+    def _hash_from(pf: pq.ParquetFile) -> str:
+        h = hashlib.md5()
+        h.update(f"{pf.metadata.num_rows}".encode())
+        h.update(str(pf.schema_arrow).encode())
+        return h.hexdigest()[:16]
+
+    try:
+        with fs.open(uri, "rb") as f:
+            return _hash_from(pq.ParquetFile(f))
+    except FileNotFoundError:
+        mirror = mirror_raw_path(asset_id, "parquet")
+        if mirror is None or not mirror.exists():
+            return None
+        return _hash_from(pq.ParquetFile(str(mirror)))
+
+
 # =============================================================================
 # Subsets (published Delta tables)
 # =============================================================================
@@ -267,6 +296,59 @@ def load_raw_parquet(asset_id: str) -> pa.Table:
     return pq.read_table(io.BytesIO(data))
 
 
+@contextmanager
+def raw_parquet_localpath(asset_id: str):
+    """Context manager yielding a local filesystem path to a raw parquet.
+
+    In dev mode: yields the dev path directly (or SSD mirror fallback) —
+    no copy.
+    In cloud mode: streams the remote parquet to a tempfile and yields
+    that path; the file is deleted on exit.
+
+    Use this when you need a file path for tools like DuckDB that read
+    parquet by path rather than loading bytes into memory. The compressed
+    parquet on disk is typically 5-10× smaller than its decompressed
+    Arrow representation, so streaming queries against the path stay
+    memory-bounded even when load_raw_parquet() would OOM.
+    """
+    from .tracking import record_read
+    import tempfile
+    import os as _os
+
+    uri = raw_uri(asset_id, "parquet")
+    record_read(f"raw/{asset_id}.parquet")
+
+    if not uri.startswith("s3://"):
+        local = Path(uri)
+        if local.exists():
+            yield str(local)
+            return
+        mirror = mirror_raw_path(asset_id, "parquet")
+        if mirror and mirror.exists():
+            yield str(mirror)
+            return
+        raise FileNotFoundError(f"Raw parquet '{asset_id}' not found at {uri}")
+
+    fs = get_fs(uri)
+    tmp = tempfile.NamedTemporaryFile(
+        suffix=f".{asset_id}.parquet", delete=False
+    )
+    tmp.close()
+    try:
+        with fs.open(uri, "rb") as src, open(tmp.name, "wb") as dst:
+            while True:
+                chunk = src.read(16 * 1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+        yield tmp.name
+    finally:
+        try:
+            _os.unlink(tmp.name)
+        except OSError:
+            pass
+
+
 # =============================================================================
 # Streaming helpers — for datasets too big to fit in memory
 #
@@ -419,16 +501,37 @@ def list_raw_files(pattern: str) -> list[str]:
 def raw_asset_exists(asset_id: str, ext: str = "parquet", max_age_days: int | None = None) -> bool:
     """Check if a raw asset exists. Optionally check it is fresh enough.
 
-    In dev mode, checks both the local dev dir AND the SSD mirror — either
-    one counts as "exists". This keeps download-if-missing nodes from
-    re-downloading data already present in the mirror.
+    Works for both s3:// URIs (via fsspec `fs.info`) and local paths. In
+    dev mode, falls back to the SSD mirror if the local dev file is
+    missing — so `download-if-missing` nodes don't re-fetch data already
+    present in the mirror.
 
     Args:
         max_age_days: If set, returns False if the asset is older than this many days.
     """
     uri = raw_uri(asset_id, ext)
 
-    def _check(p: Path) -> bool:
+    if uri.startswith("s3://"):
+        fs = get_fs(uri)
+        if not fs.exists(uri):
+            return False
+        if max_age_days is None:
+            return True
+        try:
+            info = fs.info(uri)
+        except FileNotFoundError:
+            return False
+        mtime = info.get("LastModified") or info.get("mtime")
+        if mtime is None:
+            return True  # existence confirmed, age unknown — assume fresh
+        if hasattr(mtime, "tzinfo") and mtime.tzinfo is not None:
+            now = datetime.now(mtime.tzinfo)
+        else:
+            now = datetime.now()
+        return (now - mtime) < timedelta(days=max_age_days)
+
+    # Local dev: check local dev dir, then SSD mirror.
+    def _check_local(p: Path) -> bool:
         if not p.exists():
             return False
         if max_age_days is not None:
@@ -436,12 +539,7 @@ def raw_asset_exists(asset_id: str, ext: str = "parquet", max_age_days: int | No
             return age < timedelta(days=max_age_days)
         return True
 
-    if _check(Path(uri)):
+    if _check_local(Path(uri)):
         return True
     mirror = mirror_raw_path(asset_id, ext)
-    return mirror is not None and _check(mirror)
-
-
-def get_raw_path(asset_id: str, ext: str = "parquet") -> str:
-    """Get the URI for a raw asset (s3:// in cloud, local path otherwise)."""
-    return raw_uri(asset_id, ext)
+    return mirror is not None and _check_local(mirror)

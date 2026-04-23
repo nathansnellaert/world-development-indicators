@@ -33,9 +33,40 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from .config import is_cloud, get_connector_name, get_data_dir
-from .r2 import upload_file, upload_bytes, download_bytes, get_s3_client
+from .config import is_cloud, get_connector_name, get_data_dir, get_fs, get_bucket_name
 from . import debug
+
+
+# =============================================================================
+# R2 I/O via fsspec — single backend for all cloud operations
+# =============================================================================
+
+def _r2_uri(key: str) -> str:
+    """Build an s3:// URI for a bucket-relative key."""
+    return f"s3://{get_bucket_name()}/{key}"
+
+
+def _r2_upload_bytes(data: bytes, key: str) -> None:
+    uri = _r2_uri(key)
+    fs = get_fs(uri)
+    with fs.open(uri, "wb") as f:
+        f.write(data)
+
+
+def _r2_upload_file(path: str, key: str) -> None:
+    uri = _r2_uri(key)
+    fs = get_fs(uri)
+    fs.put_file(path, uri)
+
+
+def _r2_download_bytes(key: str) -> bytes | None:
+    uri = _r2_uri(key)
+    fs = get_fs(uri)
+    try:
+        with fs.open(uri, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
 
 
 # =============================================================================
@@ -140,7 +171,7 @@ def _hydrate_resume_state(connector: str, run_id: str, log_dir: Path) -> bool:
         return (log_dir / "run.json").exists()
 
     key = f"{_connector_runs_prefix(connector, run_id)}/run.json"
-    data = download_bytes(key)
+    data = _r2_download_bytes(key)
     if data is None:
         return False
 
@@ -319,7 +350,7 @@ def _upload_server_run_manifest(connector: str, run_id: str, log_dir: Path):
     key = f"subsetsv2/runs/{connector}/run_{connector}_{run_id}.json"
     try:
         data = json.dumps(payload, indent=2).encode()
-        upload_bytes(data, key)
+        _r2_upload_bytes(data, key)
         print(f"[runner] Uploaded server run manifest to {key}")
     except Exception as e:
         print(f"[runner] Failed to upload server manifest: {e}")
@@ -462,7 +493,7 @@ def main():
             if log.is_file():
                 try:
                     key = f"{prefix}/{log.relative_to(log_dir)}"
-                    upload_file(str(log), key)
+                    _r2_upload_file(str(log), key)
                     print(f"  -> {key}")
                 except Exception as e:
                     print(f"  Failed to upload {log.name}: {e}")

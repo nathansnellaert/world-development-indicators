@@ -36,7 +36,7 @@ from typing import Callable
 
 from .tracking import (
     set_current_task, get_assets_by_writer, get_reads_by_task,
-    get_asset_version, get_io_records, clear_tracking,
+    get_asset_version, clear_tracking,
 )
 
 
@@ -458,7 +458,6 @@ class DAG:
                 "total_duration_s": sum(
                     n.get("duration_s") or 0 for n in self.state.values()
                 ),
-                "io_trace": get_io_records(),
             },
         }
 
@@ -497,13 +496,19 @@ def load_nodes(nodes_dir: Path | str | None = None) -> DAG:
         print(f"Warning: nodes directory not found: {nodes_dir}")
         return DAG(all_nodes)
 
-    node_files = sorted(nodes_dir.glob("*.py"))
+    top_level = sorted(nodes_dir.glob("*.py"))
+    nested = sorted(
+        f for f in nodes_dir.glob("*/*.py")
+        if f.parent.name != "__pycache__"
+    )
+    node_files = top_level + nested
 
     for node_file in node_files:
         if node_file.name.startswith("_"):
             continue
 
-        module_name = f"nodes.{node_file.stem}"
+        rel = node_file.relative_to(nodes_dir).with_suffix("")
+        module_name = "nodes." + ".".join(rel.parts)
 
         try:
             if module_name in sys.modules:
