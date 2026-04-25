@@ -421,7 +421,26 @@ def main():
         profiler = MemoryProfiler(process.pid, log_dir)
         profiler.start()
 
+        # SIGTERM handling depends on DAG_ON_FAILURE:
+        # - "continue" (default for cloud workflows): GitHub Actions sometimes
+        #   sends SIGTERM to the whole step when a single child OOMs and the
+        #   host briefly thrashes. The orchestrator's per-node subprocess
+        #   isolation already contained the damage — we should keep going. The
+        #   orchestrator's own handler ignores SIGTERM in continue mode, and
+        #   here we ALSO ignore it (logging only) so we don't kill the
+        #   orchestrator out from under itself.
+        # - "crash" (or unset): forward SIGTERM and enforce a 10s SIGKILL
+        #   timeout — historic behavior for callers that want quick teardown.
+        #
+        # If GitHub Actions really needs us dead it will SIGKILL the whole
+        # process group ~10s after SIGTERM, which we cannot catch.
+        on_failure = os.environ.get("DAG_ON_FAILURE", "crash")
+        ignore_sigterm = (on_failure == "continue")
+
         def handle_sigterm(signum, frame):
+            if ignore_sigterm:
+                print(f"\nReceived SIGTERM (ignored — DAG_ON_FAILURE=continue)")
+                return
             print(f"\nReceived SIGTERM, terminating child...")
             process.terminate()
             try:

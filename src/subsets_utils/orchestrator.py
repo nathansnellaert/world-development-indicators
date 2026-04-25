@@ -3,16 +3,26 @@
 The DAG class:
 - Builds a topological order from `nodes` dict (`{fn: [deps]}`)
 - Optionally inherits state from a prior run.json (resume across invocations)
-- Runs each node in order, writes run.json after each node
+- Runs each node in a fresh forked subprocess (memory isolation per node)
+- Writes run.json after each node
 - Marks status as "needs_continuation" if any node returns True (pagination)
-- Knows nothing about exit codes, time budgets, or signals — that's the
-  supervisor's job (runner.py).
+- Knows nothing about exit codes or time budgets — that's runner.py's job.
+
+Subprocess-per-node:
+- Each node is executed in a forked child process via multiprocessing.
+- Child runs one fn(), pipes back a result dict, exits. OS reclaims RSS.
+- One node OOMing only kills that node; the rest of the DAG continues.
+- Tracking state (asset_writers, io_records) is serialized by the child and
+  merged into the supervisor's tracking module after each node completes.
 
 Continuation pattern:
 - A node returns True to signal "more work to do, please retrigger me later"
 - The orchestrator records this in run.json status field
 - Runner.py reads run.json after subprocess exit and translates the status
   to an exit code (0=done, 2=continuation, 1=failed)
+- A SIGTERM that interrupts the supervisor does NOT trigger continuation —
+  the run is marked failed, and a human must investigate. Auto-retrigger
+  on host kill would loop forever on a real OOM root cause.
 
 Resume pattern:
 - LOG_DIR/run.json exists from a prior invocation → load it
@@ -20,24 +30,43 @@ Resume pattern:
 - Topology hash differs → log warning, ignore prior state, run fresh
 """
 
-import concurrent.futures
-import contextvars
 import hashlib
 import importlib.util
 import json
+import multiprocessing
 import os
+import pickle
+import signal
 import sys
 import tempfile
-import threading
+import time
 import traceback
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from . import tracking
 from .tracking import (
-    set_current_task, get_assets_by_writer, get_reads_by_task,
-    get_asset_version, clear_tracking,
+    IORecord,
+    clear_tracking,
+    get_asset_version,
+    get_assets_by_writer,
+    get_reads_by_task,
+    set_current_task,
 )
+
+
+# Fork context for subprocess-per-node execution. Fork is fast (~10ms via CoW)
+# and lets the child inherit the supervisor's loaded modules and DAG metadata
+# without re-importing anything. Linux + macOS supported (our stack —
+# pyarrow/fsspec/requests/deltalake — does not touch fork-unsafe Apple APIs).
+_MP_CTX = multiprocessing.get_context("fork")
+
+# Cap on the pickled size of a child→supervisor result dict. Defends against a
+# node accidentally stuffing a large pa.Table into a tracking record. 10 MB is
+# generous: tracking records are tiny strings and stack snippets.
+_MAX_RESULT_PICKLE_BYTES = 10 * 1024 * 1024
 
 
 def _get_task_id(fn: Callable) -> str:
@@ -87,6 +116,107 @@ def _load_run_state(log_dir: Path) -> dict | None:
         return None
 
 
+def _child_entrypoint(fn: Callable, task_id: str, pipe_w) -> None:
+    """Runs in a forked child process. Executes one DAG node and pipes back
+    a result dict. The child inherits the supervisor's modules and tracking
+    dicts via fork; we clear tracking on entry so the snapshot we send back
+    contains only this node's I/O.
+
+    The result dict shape:
+        {
+            "task_id": str,
+            "status": "done" | "failed",
+            "started_at": iso8601 str,
+            "finished_at": iso8601 str,
+            "duration_s": float,
+            "needs_continuation": bool,        # only when status == "done"
+            "error": str (only on failed),
+            "traceback": str (only on failed),
+            "tracking": {
+                "asset_writers": {asset_path: task_id},
+                "asset_versions": {asset_path: {"version": int, "hash": str}},
+                "io_records": [{"asset_path", "task_id", "operation", "stack"}],
+            }
+        }
+    """
+    # Reset signal handlers in the child — supervisor's SIGTERM handler is
+    # CoW-inherited but does not apply to children. Default disposition for
+    # SIGTERM is "terminate" which is what we want when supervisor escalates.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    clear_tracking()
+    set_current_task(task_id)
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    result: dict = {
+        "task_id": task_id,
+        "started_at": started_at,
+        "status": "failed",
+        "needs_continuation": False,
+    }
+
+    try:
+        ret = fn()
+        result["status"] = "done"
+        if ret is True:
+            result["needs_continuation"] = True
+    except BaseException as e:  # noqa: BLE001 — surface every failure mode
+        result["status"] = "failed"
+        result["error"] = str(e) or e.__class__.__name__
+        result["traceback"] = traceback.format_exc()
+
+    finished_at = datetime.now(timezone.utc).isoformat()
+    result["finished_at"] = finished_at
+    try:
+        result["duration_s"] = (
+            datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)
+        ).total_seconds()
+    except Exception:
+        result["duration_s"] = 0.0
+
+    result["tracking"] = {
+        "asset_writers": dict(tracking._asset_writers),
+        "asset_versions": dict(tracking._asset_versions),
+        "io_records": [asdict(r) for r in tracking._io_records],
+    }
+
+    # Flush stdio before sending result. Fork-inherited pipes can drop the
+    # last buffered line if the child exits without flushing.
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    try:
+        payload = pickle.dumps(result)
+        if len(payload) > _MAX_RESULT_PICKLE_BYTES:
+            raise ValueError(
+                f"result too large ({len(payload)} bytes > {_MAX_RESULT_PICKLE_BYTES}); "
+                "a node likely stashed a large object in tracking"
+            )
+        pipe_w.send_bytes(payload)
+    except Exception as e:  # serialization or pipe write failure
+        try:
+            fallback = pickle.dumps({
+                "task_id": task_id,
+                "started_at": started_at,
+                "finished_at": finished_at,
+                "duration_s": result.get("duration_s", 0.0),
+                "status": "failed",
+                "error": f"failed to serialize result: {e}",
+                "traceback": traceback.format_exc(),
+                "needs_continuation": False,
+                "tracking": {"asset_writers": {}, "asset_versions": {}, "io_records": []},
+            })
+            pipe_w.send_bytes(fallback)
+        except Exception:
+            pass
+    finally:
+        try:
+            pipe_w.close()
+        except Exception:
+            pass
+
+
 class DAG:
     def __init__(self, nodes: dict[Callable, list[Callable]]):
         self.nodes = nodes
@@ -94,6 +224,7 @@ class DAG:
         self._fn_to_id: dict[Callable, str] = {}
         self._id_to_fn: dict[str, Callable] = {}
         self._needs_continuation = False
+        self._shutdown_requested = False
         self.topology_hash = _topology_hash(nodes)
 
         for fn in nodes:
@@ -178,37 +309,98 @@ class DAG:
     # Execution
     # =========================================================================
 
-    def _run_task(self, fn: Callable) -> dict:
-        """Run a single node function inline. Updates self.state in place."""
+    def _spawn_task(self, fn: Callable):
+        """Fork a child process to run one node. Returns (proc, pipe_r).
+
+        The supervisor closes its copy of the pipe write-end after fork so the
+        read-end sees a clean EOF if the child dies without sending. The child
+        inherits the read-end too but never uses it; that's harmless.
+        """
         task_id = self._fn_to_id[fn]
-        task_state = self.state[task_id]
-        task_state["status"] = "running"
-        task_state["started_at"] = datetime.now(timezone.utc).isoformat()
+        pipe_r, pipe_w = _MP_CTX.Pipe(duplex=False)
+        proc = _MP_CTX.Process(
+            target=_child_entrypoint,
+            args=(fn, task_id, pipe_w),
+            name=f"node:{task_id}",
+        )
+        proc.start()
+        # After fork, the child holds its own ref to pipe_w. The supervisor
+        # must drop its copy so the pipe closes cleanly on child exit.
+        pipe_w.close()
+        return proc, pipe_r
 
-        set_current_task(task_id)
+    def _collect_result(self, proc: multiprocessing.Process, pipe_r) -> dict:
+        """Join a child proc and read the result dict it sent. If the child
+        died before sending (OOM SIGKILL, segfault, etc.), synthesize a failure
+        result based on its exit code."""
+        proc.join()
+
+        result: dict | None = None
+        if pipe_r.poll():
+            try:
+                result = pickle.loads(pipe_r.recv_bytes())
+            except Exception as e:
+                result = None
         try:
-            result = fn()
-            task_state["status"] = "done"
-            # If the node returns True it signals "more work remains" — runner
-            # picks up via run.json status="needs_continuation" and exit code 2.
-            if result is True:
-                task_state["needs_continuation"] = True
-                self._needs_continuation = True
-        except Exception as e:
-            task_state["status"] = "failed"
-            task_state["error"] = str(e)
-            task_state["traceback"] = traceback.format_exc()
-        finally:
-            task_state["finished_at"] = datetime.now(timezone.utc).isoformat()
-            started = datetime.fromisoformat(task_state["started_at"])
-            finished = datetime.fromisoformat(task_state["finished_at"])
-            task_state["duration_s"] = (finished - started).total_seconds()
-            set_current_task(None)
+            pipe_r.close()
+        except Exception:
+            pass
 
-        return task_state
+        if result is not None:
+            return result
+
+        # Child died without sending a result.
+        exitcode = proc.exitcode
+        if exitcode is None:
+            error = "child still alive after join (should not happen)"
+        elif exitcode < 0:
+            try:
+                signame = signal.Signals(-exitcode).name
+            except (ValueError, AttributeError):
+                signame = f"signal {-exitcode}"
+            error = f"killed by {signame} (exitcode={exitcode}); likely OOM or external kill"
+        else:
+            error = f"child exited with code {exitcode} before sending result"
+
+        now = datetime.now(timezone.utc).isoformat()
+        return {
+            "task_id": proc.name.split(":", 1)[-1] if ":" in proc.name else proc.name,
+            "status": "failed",
+            "error": error,
+            "traceback": "",
+            "started_at": now,
+            "finished_at": now,
+            "duration_s": 0.0,
+            "needs_continuation": False,
+            "tracking": {"asset_writers": {}, "asset_versions": {}, "io_records": []},
+        }
+
+    def _apply_result(self, task_id: str, result: dict) -> None:
+        """Merge a child result dict into self.state and the tracking module."""
+        task_state = self.state[task_id]
+        task_state["status"] = result["status"]
+        task_state["started_at"] = result.get("started_at")
+        task_state["finished_at"] = result.get("finished_at")
+        task_state["duration_s"] = result.get("duration_s")
+        if result["status"] == "failed":
+            task_state["error"] = result.get("error", "unknown")
+            task_state["traceback"] = result.get("traceback", "")
+        elif result.get("needs_continuation"):
+            task_state["needs_continuation"] = True
+            self._needs_continuation = True
+
+        # Merge child's tracking snapshot into the supervisor's tracking module
+        # so to_json() and _print_node_detail() see this node's I/O.
+        snapshot = result.get("tracking") or {}
+        with tracking._lock:
+            tracking._asset_writers.update(snapshot.get("asset_writers", {}))
+            tracking._asset_versions.update(snapshot.get("asset_versions", {}))
+            for r in snapshot.get("io_records", []):
+                tracking._io_records.append(IORecord(**r))
 
     def run(self, targets: list[str] | None = None):
-        """Execute all nodes in dependency order, writing run.json after each.
+        """Execute all nodes in dependency order, each in its own forked
+        subprocess. Writes run.json after every node.
 
         Args:
             targets: Optional list of node names to run (assumes deps already ran).
@@ -217,11 +409,17 @@ class DAG:
             DAG_TARGET: Comma-separated node names to run (overrides `targets`).
             DAG_ON_FAILURE: "crash" (default) or "continue".
             DAG_PARALLELISM: Max concurrent nodes (default 1 = sequential).
+            DAG_DRAIN_TIMEOUT_S: Max seconds to wait for children on SIGTERM (default 8).
 
         Behavior:
+            - Each node runs in a fresh forked child; OS reclaims RSS on exit.
+            - A node OOM (SIGKILL) only fails that node; the rest of the DAG
+              continues unless DAG_ON_FAILURE=crash.
             - On a node returning True: marks needs_continuation, continues running.
             - On node failure with crash mode: drains in-flight tasks, then raises.
             - On node failure with continue mode: raises after all nodes complete.
+            - On SIGTERM: drains in-flight, marks remaining as failed, schreef
+              run.json with status="failed". No auto-retrigger from host kill.
             - The DAG class never calls sys.exit() — exit codes are runner.py's job.
         """
         clear_tracking()
@@ -292,50 +490,84 @@ class DAG:
                     ready.append(fn)
             return ready
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=parallelism) as ex:
-            in_flight: dict[concurrent.futures.Future, str] = {}
+        # Each node runs in its own forked subprocess so memory is reclaimed
+        # between nodes. in_flight maps a live Process to its (task_id, pipe_r).
+        in_flight: dict[multiprocessing.Process, tuple[str, object]] = {}
 
-            def submit_more():
-                if stop_submitting:
+        # SIGTERM policy depends on DAG_ON_FAILURE:
+        #
+        # - "continue": ignore SIGTERM entirely. GitHub Actions sometimes sends
+        #   SIGTERM to the whole step when a child OOMs and the host briefly
+        #   thrashes — but the OOM killer already reaped the offending child,
+        #   so we can keep going. If GH really wants us dead it sends SIGKILL
+        #   ~10s after SIGTERM, which we cannot catch, and the step dies hard.
+        #   That is acceptable: save_state runs after every node so at most a
+        #   few seconds of progress is lost.
+        #
+        # - "crash" (default): drain in-flight, mark pending, exit. Used by
+        #   callers who want a single failure to halt the run cleanly.
+        prior_handler = signal.getsignal(signal.SIGTERM)
+        ignore_sigterm = (on_failure == "continue")
+
+        def _on_sigterm(signum, frame):
+            nonlocal stop_submitting
+            if ignore_sigterm:
+                print("[DAG] Received SIGTERM (ignored — DAG_ON_FAILURE=continue)")
+                return
+            print("[DAG] Received SIGTERM, draining in-flight nodes...")
+            stop_submitting = True
+            self._shutdown_requested = True
+
+        try:
+            signal.signal(signal.SIGTERM, _on_sigterm)
+        except ValueError:
+            # signal.signal can only be called from the main thread; if we're
+            # in a worker thread we just skip — the supervisor is normally main.
+            pass
+
+        def submit_more():
+            if stop_submitting:
+                return
+            for fn in find_ready():
+                if len(in_flight) >= parallelism:
                     return
-                for fn in find_ready():
-                    if len(in_flight) >= parallelism:
-                        return
-                    task_id = self._fn_to_id[fn]
-                    # Reserve the slot before submission so the next find_ready()
-                    # call doesn't see this node as pending and re-submit it.
-                    self.state[task_id]["status"] = "running"
-                    print(f"[DAG] Running {task_id}...")
-                    ctx = contextvars.copy_context()
-                    fut = ex.submit(ctx.run, self._run_task, fn)
-                    in_flight[fut] = task_id
+                task_id = self._fn_to_id[fn]
+                # Reserve the slot before fork so the next find_ready() doesn't
+                # see this node as pending and re-spawn it.
+                self.state[task_id]["status"] = "running"
+                self.state[task_id]["started_at"] = datetime.now(timezone.utc).isoformat()
+                print(f"[DAG] Running {task_id}...")
+                proc, pipe_r = self._spawn_task(fn)
+                in_flight[proc] = (task_id, pipe_r)
 
+        def collect_one(proc: multiprocessing.Process) -> dict:
+            """Pop a finished proc, collect its result, apply, save_state."""
+            task_id, pipe_r = in_flight.pop(proc)
+            result = self._collect_result(proc, pipe_r)
+            self._apply_result(task_id, result)
+            self.save_state()
+            return result
+
+        try:
             submit_more()
 
             while in_flight:
-                done_futs, _ = concurrent.futures.wait(
-                    in_flight.keys(),
-                    return_when=concurrent.futures.FIRST_COMPLETED,
-                )
-                for fut in done_futs:
-                    task_id = in_flight.pop(fut)
-                    # _run_task captures exceptions internally, but surface any
-                    # unexpected ones (e.g. thread/scheduler bugs) loudly.
-                    try:
-                        fut.result()
-                    except Exception as e:
-                        st = self.state[task_id]
-                        if st.get("status") != "failed":
-                            st["status"] = "failed"
-                            st["error"] = f"executor: {e}"
-                            st["traceback"] = traceback.format_exc()
+                # Wait for any child to exit. We poll on a timeout so the
+                # SIGTERM-set stop_submitting flag is observed promptly.
+                sentinels = [p.sentinel for p in in_flight]
+                ready = multiprocessing.connection.wait(sentinels, timeout=1.0)
 
-                    result = self.state[task_id]
-                    self.save_state()  # checkpoint after every node
+                # Map sentinels back to processes. multiprocessing.connection.wait
+                # returns the sentinel objects; we match by identity.
+                done_procs = [p for p in list(in_flight) if p.sentinel in ready]
+                for proc in done_procs:
+                    task_id, _ = in_flight[proc]
+                    result = collect_one(proc)
 
                     if result["status"] == "done":
                         cont_msg = " (needs continuation)" if result.get("needs_continuation") else ""
-                        print(f"[DAG] {task_id} done ({result['duration_s']:.1f}s){cont_msg}")
+                        duration = result.get("duration_s") or 0.0
+                        print(f"[DAG] {task_id} done ({duration:.1f}s){cont_msg}")
                         if os.environ.get("DAG_VERBOSE") == "1":
                             self._print_node_detail(task_id)
                     else:
@@ -345,14 +577,69 @@ class DAG:
                         if on_failure == "crash":
                             stop_submitting = True
 
+                if self._shutdown_requested:
+                    break
+
                 submit_more()
+
+            # Drain any remaining in-flight children after a shutdown signal.
+            if in_flight:
+                drain_timeout = float(os.environ.get("DAG_DRAIN_TIMEOUT_S", "8"))
+                deadline = time.monotonic() + drain_timeout
+                while in_flight and time.monotonic() < deadline:
+                    remaining = max(0.0, deadline - time.monotonic())
+                    sentinels = [p.sentinel for p in in_flight]
+                    ready = multiprocessing.connection.wait(sentinels, timeout=remaining)
+                    for proc in [p for p in list(in_flight) if p.sentinel in ready]:
+                        collect_one(proc)
+
+                # Anyone still alive: SIGTERM, then SIGKILL.
+                for proc in list(in_flight):
+                    task_id, pipe_r = in_flight[proc]
+                    print(f"[DAG] {task_id}: sending SIGTERM to child...")
+                    try:
+                        proc.terminate()
+                        proc.join(timeout=5)
+                    except Exception:
+                        pass
+                    if proc.is_alive():
+                        print(f"[DAG] {task_id}: SIGKILL")
+                        try:
+                            proc.kill()
+                            proc.join(timeout=2)
+                        except Exception:
+                            pass
+                    # Synthesize a failure result for shutdown-killed nodes.
+                    in_flight.pop(proc, None)
+                    now = datetime.now(timezone.utc).isoformat()
+                    self._apply_result(task_id, {
+                        "task_id": task_id,
+                        "status": "failed",
+                        "error": "killed during shutdown",
+                        "traceback": "",
+                        "started_at": self.state[task_id].get("started_at") or now,
+                        "finished_at": now,
+                        "duration_s": 0.0,
+                        "needs_continuation": False,
+                        "tracking": {"asset_writers": {}, "asset_versions": {}, "io_records": []},
+                    })
+                    self.save_state()
+                    if first_failure is None:
+                        first_failure = self.state[task_id]
+        finally:
+            # Restore prior signal handler (mostly relevant for tests / repeated runs).
+            try:
+                signal.signal(signal.SIGTERM, prior_handler)
+            except (ValueError, TypeError):
+                pass
 
         # Final state save with overall status
         self.save_state()
 
         if first_failure is not None:
+            failed_id = first_failure.get("id") or first_failure.get("task_id") or "unknown"
             raise RuntimeError(
-                f"[DAG] {first_failure['id']} failed: {first_failure.get('error', 'unknown')}"
+                f"[DAG] {failed_id} failed: {first_failure.get('error', 'unknown')}"
             )
 
         return self
